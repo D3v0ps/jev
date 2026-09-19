@@ -1,0 +1,28 @@
+[project]
+name = "jevkit"
+version = "0.1.0"
+description = "Ten production patterns for TypeSafe's Jev: decisions instead of generated text."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["typesafe-sdk>=0.7,<1"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["jevkit"]
+
+[dependency-groups]
+dev = ["pytest>=8.4,<9", "pytest-asyncio>=0.24,<2", "ruff>=0.14,<1"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
