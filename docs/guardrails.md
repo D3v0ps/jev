@@ -177,12 +177,23 @@ Three rows carry the whole case for a direction parameter:
 
 ### No flag threshold may sit above an uninformative answer
 
-`UNINFORMATIVE_NOUL = 0.50`, and `check_policy()` fails if any flag threshold — after the direction
-scale — sits above it. A noul carries no confidence, so "the model has no idea" arrives as `0.5`;
-this invariant means such an answer costs a FLAG rather than a clearance. It is why the `leak`
+`UNINFORMATIVE_NOUL = 0.50`. A noul carries no confidence, so "the model has no idea" arrives as
+`0.5`; this invariant means such an answer costs a FLAG rather than a clearance. It is why the `leak`
 inbound and `injection` outbound cells read 0.50 where 0.55 would otherwise have been defensible.
-`tests/test_guardrails.py` asserts it behaviourally on all 44 cells, and asserts that a reply with
-*nothing* scripted is never a PASS.
+
+It is enforced twice, because the tables above are not the only source of a threshold:
+
+- `check_policy()` reports a problem if any flag threshold **as written in this module** — for a
+  hazard, after the direction scale — sits above it. That keeps the invariant a claim about the
+  numbers a reviewer reads.
+- `effective_flag`, which every threshold read goes through, clamps the value to 0.50. That is what
+  covers a `Hazard` **you** built: it goes through no table here, and the direction scale multiplies
+  its thresholds. A category with `flag_at=0.40` read 0.54 on retrieved text before the clamp, so a
+  wholly uninformative 0.50 reading on it cleared — PASS, nothing flagged. Clamping only ever lowers
+  a threshold, and `Decision.thresholds` reports the clamped number, which is the one that fired.
+
+`tests/test_guardrails.py` asserts it behaviourally on all 44 built-in cells, on a caller-defined
+hazard in all four directions, and asserts that a reply with *nothing* scripted is never a PASS.
 
 ### Harm, combined
 
@@ -194,10 +205,16 @@ threshold. First matching row wins.
 | 0.75    | 0.30              | `BLOCK`  |
 | 0.50    | 0.20              | `REVIEW` |
 
+`decide` takes the first row both numbers satisfy and stops, so the rows have to weaken downward as
+well as run strongest-first on harm; `check_policy()` reports a hand-edit that swaps the verdict
+column, which would otherwise let less harm block while more harm only reviewed.
+
 `HARM_BLOCK_DIRECTIONS` limits the BLOCK row to inbound and outbound; on retrieved and tool text it
-stops at REVIEW. And with nothing flagged at all, `HARM_ALONE_REVIEW_AT = 0.80` still holds the
-text, because a high harm reading with no category behind it is the one thing a category list
-cannot tell you.
+stops at REVIEW. Independently of all of that, `HARM_ALONE_REVIEW_AT = 0.80` holds the text whenever
+the harm reading reaches 0.80 — whether or not anything flagged — because a high harm reading the
+configured categories do not name is the one thing a category list cannot tell you. It is a separate
+check rather than an `else`: every rule here may only raise the verdict, so a *louder* hazard reading
+can never produce a more permissive outcome.
 
 ### The confidence floor
 
@@ -263,24 +280,63 @@ not a Noul all raise from `resolve_hazards` before anything is sent.
 ## Cost arithmetic
 
 From `jevkit.cost`: jev-1.13.0 is **$42 per billion input tokens** = $0.042 per million, and output
-tokens are free. The numbers below are local estimates from `jevkit.limits.estimate_tokens` (a
-characters-per-token approximation that overestimates), produced by this repository's own code; the
-example prints the *measured* `input_tokens` the API reported for the same requests.
+tokens are free. Every number below is a local estimate from `jevkit.limits.estimate_tokens`, which
+is a ~4-characters-per-token approximation and **not a tokenizer** — it overestimates on purpose, so
+a request it says fits does fit. The example prints the *measured* `input_tokens` the API reported
+for its own requests; nothing here is a measurement of a live call.
 
-| What is screened                                | Questions | ~tokens | $ / screening | $ / 100k |
-| ----------------------------------------------- | --------- | ------- | ------------- | -------- |
-| a 52-character user message, 8 categories       | 13        | 3,146   | $0.00013      | $13.21   |
-| a 2,000-character response, 8 categories        | 13        | 3,626   | $0.00015      | $15.23   |
-| a 6,000-character retrieved passage             | 13        | 4,640   | $0.00019      | $19.49   |
-| a full 24,000-character screening               | 13        | 9,140   | $0.00038      | $38.39   |
-| a 2,000-character response, **3** categories    | 8         | 2,525   | $0.00011      | $10.61   |
+This is the script that produced the table. It counts the encoded request this recipe actually
+builds — `build_state` plus `build_questions`, so the state (direction, boundary description,
+`operator_task`, `source`, the text) and every question's full wording — for a screening with no
+`source` and no `operator_task`:
 
-The shape of that table is the useful part: the **question set is about 3,000 tokens**, so for
-short text the wording dominates the bill, not the text. The lever is therefore the number of
-categories you configure, not the length of what you screen. Screening only the three categories
-your product can actually be in trouble over costs about a third less per call on short text, and
-drops five probabilities you might have wanted for calibration later. That is a real trade, and it
-is yours.
+```python
+from jevkit import cost
+from jevkit.limits import check_request
+from jevkit.recipes.guardrails import (
+    CHILD_SEXUAL, INBOUND, OUTBOUND, RETRIEVED, SELF_HARM, VIOLENCE,
+    build_questions, build_state, prepare,
+)
+
+def row(text, direction=INBOUND, hazards=None):
+    screening = prepare(text, direction=direction, hazards=hazards)
+    tokens = check_request(build_state(screening), build_questions(screening))
+    return tokens, cost.usd_for("jev-1.13.0", tokens)
+
+row("x" * 52)                                                    # (3146, 0.000132132)
+row("x" * 2_000, OUTBOUND)                                       # (3626, 0.000152292)
+row("x" * 6_000, RETRIEVED)                                      # (4640, 0.00019488)
+row("x" * 24_000)                                                # (9133, 0.000383586)
+row("x" * 24_001)                                                # (9165, 0.00038493) — tail dropped
+row("x" * 2_000, OUTBOUND, [CHILD_SEXUAL, VIOLENCE, SELF_HARM])  # (2525, 0.00010605)
+```
+
+The direction is part of the count: its description travels in the state, so the same text costs a
+few tokens more or less per boundary.
+
+| What is screened                                     | Questions | ~tokens | $ / screening | $ / 100k |
+| ---------------------------------------------------- | --------- | ------- | ------------- | -------- |
+| a 52-character user message, 8 categories            | 13        | 3,146   | $0.00013      | $13.21   |
+| a 2,000-character response, 8 categories             | 13        | 3,626   | $0.00015      | $15.23   |
+| a 6,000-character retrieved passage                  | 13        | 4,640   | $0.00019      | $19.49   |
+| a 24,000-character screening, exactly at the cap     | 13        | 9,133   | $0.00038      | $38.36   |
+| a 24,001-character screening, one over the cap          | 13     | 9,165   | $0.00038      | $38.49   |
+| a 2,000-character response, **3** categories         | 8         | 2,525   | $0.00011      | $10.61   |
+
+The last row is one character over the cap, where the `not_screened` note is added. Longer
+inputs cost a little more than it, not the same: the note carries the number of characters
+withheld, so the row creeps up by a token or two as that number gains digits.
+
+The `$ / 100k` column is the middle column times 100,000 — arithmetic on an estimate, not a bill
+anyone has paid.
+
+The shape of that table is the useful part: the **question set is 3,072 tokens** with the default
+eight categories and 1,971 with three (`sum(estimate_tokens(q) for q in build_questions(s).values())`),
+so for short text the wording dominates the bill, not the text. The lever is therefore the number of
+categories you configure, not the length of what you screen. Screening only the three categories your
+product can actually be in trouble over costs about 30% less per call on the 2,000-character row
+(3,626 → 2,525 tokens), and drops five probabilities you might have wanted for calibration later.
+That is a real trade, and it is yours.
 
 None of these numbers is a comparison. This repository contains no measured baseline for an
 LLM-based screener, so it quotes no ratio against one. If you want the comparison, run your own
@@ -307,7 +363,21 @@ warning, not an error, since a mixed set describes no single policy row.
 
 `observed` raises rather than aligning: a label list of the wrong length, or a decision that failed
 closed before any answer arrived, would quietly shift every pair and produce a confident, wrong
-report.
+report. A run that mixes clean screenings with ones that failed closed therefore has to be filtered
+before it is paired — out loud, so the dropped ones are visible;
+`examples/guardrails.py` shows that.
+
+The harm Score is sweepable the same way, which matters because `HARM_ALONE_REVIEW_AT` and the
+`harm at` column of `HARM_PAIRS` are thresholds in the review block too. Pass `HARM_QUESTION_ID`, and
+`observed` reads `Decision.harm` — the reading normalised to 0..1 by `reply.unit`, the same scale
+those two thresholds are written on:
+
+```python
+from jevkit.recipes.guardrails import HARM_ALONE_REVIEW_AT, HARM_QUESTION_ID, observed, threshold_report
+
+pairs = observed(decisions, my_labels, HARM_QUESTION_ID)  # my_labels: was crossing really harmful?
+threshold_report(pairs, HARM_ALONE_REVIEW_AT)
+```
 
 **These functions count what your data does at a threshold. They are not a measurement of the
 model's accuracy**, and they cannot be: the labels are yours, the examples are yours, and a rate
@@ -335,7 +405,10 @@ labelled data per direction, and read `ThresholdReport.directions`.
 
 **Categories you did not configure are not screened.** `harm_if_crossed` is the only catch-all, and
 it is one Score with five levels. If your product has a hazard the catalogue does not name, add a
-`Hazard` — with thresholds you can defend — rather than hoping the harm score notices.
+`Hazard` — with thresholds you can defend — rather than hoping the harm score notices. Your
+thresholds are yours, with one floor kept over them: a flag threshold is clamped to
+`UNINFORMATIVE_NOUL` when read, so a category of yours cannot clear a coin-flip reading either, in
+any direction.
 
 **An answer can be valid and wrong.** Constrained output removes parse failures and invented
 identifiers. It does not remove mistakes, and a text written specifically to read as benign to a
@@ -347,6 +420,7 @@ is quietly weaker in one language is a hole in one language. Watch the harm-scor
 non-English text; the floor is doing real work there.
 
 **The recipe adds latency and cost to every boundary crossing.** Whether that is worth paying is a
-measurement on your traffic, not a claim made here. `examples/guardrails.py` prints the ledger; the
-extrapolations in the cost table are arithmetic on it, and per 100,000 screenings they are not
-nothing.
+measurement on your traffic, not a claim made here. The cost table above is arithmetic on local
+token *estimates*, so treat it as an order of magnitude; `examples/guardrails.py` prints the ledger
+from a real run — measured latency, measured `input_tokens`, measured dollars — and that is the only
+place a number in this repository comes from a live call. Per 100,000 screenings, neither is nothing.

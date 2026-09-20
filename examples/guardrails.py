@@ -198,7 +198,19 @@ def main() -> None:
     print("(six examples is a demonstration, not a calibration set — bring a few hundred)")
     print("(the samples span four directions, so the reports say so: the direction is in the state,")
     print(" the thresholds differ per direction, and one mixed set describes no single policy row)")
-    examples = observed(decisions, list(INJECTION_LABELS), INJECTION)
+    # A screening that failed closed carries no probabilities, and `observed`
+    # rightly refuses to pair one. Drop those here, out loud, rather than letting
+    # one transient 429 take the whole demonstration down with it.
+    pairs = zip(decisions, INJECTION_LABELS, strict=True)
+    usable = [(d, label) for d, label in pairs if INJECTION in d.signals]
+    failed = [d for d in decisions if INJECTION not in d.signals]
+    if failed:
+        print(f"({len(failed)} of {len(decisions)} screenings failed closed with no answers, so they")
+        print(f" are not in the counts below; they landed on {[d.verdict for d in failed]})")
+    if not usable:
+        print("  no screening returned an answer, so there is nothing to threshold")
+        return
+    examples = observed([d for d, _ in usable], [label for _, label in usable], INJECTION)
     for report in sweep(examples, list(CANDIDATES)):
         print(f"  {report_line(report)}")
 

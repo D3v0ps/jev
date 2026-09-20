@@ -23,7 +23,9 @@ Four things keep it honest:
 - **Pinned blocks are not part of the decision.** The system prompt, the current goal, the
   user's last message and anything else the caller pins are never dropped and are never
   asked about. They go into the state as the thing every other block is judged *against*:
-  a block is load-bearing relative to a goal, not in the abstract.
+  a block is load-bearing relative to a goal, not in the abstract. Pinned context that did
+  not fit the state is named in `decision.pinned_omitted`, because a decision taken without
+  the goal in view is a weaker one and the caller is the only one who can fix it.
 - **Code owns the budget.** The model supplies a value per block; the selection is a
   deterministic greedy fill by value per token with recency as the tie-break. Same answers
   in, same blocks out, every time — a property a reviewer can check and a summariser
@@ -125,11 +127,6 @@ STEERING_VALUE_CAP = 0.25
 #: is treated as load-bearing, so an unanswered question costs tokens, never content.
 UNJUDGED_VALUE = 1.0
 
-#: Blocks judged in one request. A ceiling on questions per request (three per block) and
-#: on how much of the transcript one state has to carry. Lower than the token budgets
-#: usually allow, so the shard boundary is a number a reviewer can see rather than a
-#: consequence of how long the blocks happened to be.
-MAX_BLOCKS_PER_SHARD = 48
 #: Requests one compaction will ever spend. Blocks past this are reported as unjudged and
 #: kept, so a runaway transcript costs a bounded amount and never loses content by default.
 #: Shards are filled oldest first, which is where the droppable blocks are.
@@ -144,7 +141,9 @@ PINNED_STATE_TOKENS = 8_000
 #: Characters of one block's text that reach the state. A longer block is clipped *in the
 #: state only* — it is still kept or dropped whole — and the characters cut are reported.
 BLOCK_CHARS_BUDGET = 2_000 * limits.CHARS_PER_TOKEN
-#: Derived from the documented limits: state, and state plus all its questions.
+#: Derived from the documented limits: state, and state plus all its questions. What a shard
+#: can hold in blocks is derived from these too, at the end of this block — a shard boundary
+#: picked by hand below them would spend a second request on a transcript that fits in one.
 SHARD_STATE_TOKENS = limits.STATE_PLUS_LONGEST_QUESTION_TOKENS - SHARD_TOKEN_RESERVE
 SHARD_TOTAL_TOKENS = limits.CONTEXT_TOKENS - SHARD_TOKEN_RESERVE
 
@@ -170,34 +169,54 @@ def build_state(
     *,
     shard: int = 0,
     shards: int = 1,
-) -> tuple[dict[str, Any], int, int]:
+) -> StateView:
     """The material every question sees: the pinned context, then the candidate blocks.
 
-    Returns the state, the characters clipped out of it, and how many pinned blocks fit.
-    Pinned blocks are here to be judged *against*, never about: the goal is what makes a
-    block load-bearing. The most recent ones are preferred when they do not all fit, and at
-    least one is always shown, because the newest pinned block is usually the live request.
-    `position` is each block's index in the whole transcript, so the model can see what came
-    after a block when deciding whether anything still needs it.
-    """
-    clipped = 0
-    pinned: list[dict[str, Any]] = []
-    room = PINNED_STATE_TOKENS
-    for block in reversed(transcript.pinned):
-        entry = {"role": block.role, "text": block.text[:BLOCK_CHARS_BUDGET]}
-        needed = limits.estimate_tokens(entry)
-        if pinned and needed > room:
-            break
-        room -= needed
-        clipped += max(0, len(block.text) - BLOCK_CHARS_BUDGET)
-        pinned.append(entry)
-    pinned.reverse()
+    Returns a `StateView`: the state, the characters clipped out of the pinned context and
+    out of the candidates counted separately, and which pinned blocks fit.
 
+    Pinned blocks are here to be judged *against*, never about: "load-bearing" is a relation
+    to a goal, so a state the goal did not fit into is a guess. They are offered the room in
+    `PINNED_STATE_TOKENS` in a fixed priority — the oldest pinned block first (usually the
+    system prompt), then the newest (usually the live request), then the middle ones newest
+    first — and a pinned block too long for the room left is *skipped*, not treated as the
+    end of the fill, so a ten-token goal still reaches the state from behind a long pinned
+    tool doc. The first block of that order is always shown, and `pinned_ids` names every
+    block that made it, so a caller can tell which one did not. A pinned block clipped to
+    `BLOCK_CHARS_BUDGET` carries the same `clipped_chars` marker a candidate does, because a
+    goal cut mid-sentence must not read as a whole goal. `position` is each candidate's index
+    in the whole transcript, so the model can see what came after a block when deciding
+    whether anything still needs it.
+    """
+    ordered = list(transcript.pinned)
+    priority = ordered[:1]
+    if len(ordered) > 1:
+        priority.append(ordered[-1])
+        priority.extend(reversed(ordered[1:-1]))
+
+    clipped_pinned = 0
+    shown: dict[str, dict[str, Any]] = {}
+    room = PINNED_STATE_TOKENS
+    for block in priority:
+        cut = max(0, len(block.text) - BLOCK_CHARS_BUDGET)
+        entry: dict[str, Any] = {"role": block.role, "text": block.text[:BLOCK_CHARS_BUDGET]}
+        if cut:
+            entry["clipped_chars"] = cut
+        needed = limits.estimate_tokens(entry)
+        if shown and needed > room:
+            continue
+        room -= needed
+        clipped_pinned += cut
+        shown[block.id] = entry
+    pinned_ids = tuple(block.id for block in ordered if block.id in shown)
+    pinned = [shown[block_id] for block_id in pinned_ids]
+
+    clipped_blocks = 0
     blocks: dict[str, Any] = {}
     for label in labels:
         block = transcript.labels[label]
         cut = max(0, len(block.text) - BLOCK_CHARS_BUDGET)
-        clipped += cut
+        clipped_blocks += cut
         entry = {
             "position": transcript.position[block.id],
             "role": block.role,
@@ -219,7 +238,12 @@ def build_state(
             "shards": shards,
         },
     }
-    return state, clipped, len(pinned)
+    return StateView(
+        state=state,
+        clipped_pinned=clipped_pinned,
+        clipped_blocks=clipped_blocks,
+        pinned_ids=pinned_ids,
+    )
 
 
 def build_questions(labels: Sequence[str]) -> dict[str, Any]:
@@ -301,6 +325,22 @@ def build_questions(labels: Sequence[str]) -> dict[str, Any]:
     return questions
 
 
+#: What the three questions about one block cost, measured with `limits.estimate_tokens` over
+#: what `build_questions` actually builds rather than written down by hand. It is the term
+#: that dominates a request: the state of a short block is tens of tokens, its questions are
+#: hundreds. Edit the questions above and this follows.
+QUESTION_TOKENS_PER_BLOCK = sum(
+    limits.estimate_tokens(question) for question in build_questions(["b0"]).values()
+)
+#: The most candidates one request will ever carry: the shard's whole-request budget divided
+#: by what one block's questions cost. Derived, not chosen — a smaller hand-picked ceiling
+#: would split a transcript that fits one request, and the comment in `compact()` that
+#: justifies a second round trip would stop being true. It is an upper bound rather than the
+#: usual trigger: the state costs tokens too, so `plan()` normally reaches the token budgets
+#: a block or two before this count.
+MAX_BLOCKS_PER_SHARD = SHARD_TOTAL_TOKENS // QUESTION_TOKENS_PER_BLOCK
+
+
 # --- end of review block -----------------------------------------------------
 
 
@@ -310,6 +350,33 @@ Reason = Literal["compacted", "already_fits", "no_candidates", "refused", "faile
 #: A caller's token counter. `len`-of-text by default via jevkit.limits; pass your model's
 #: tokenizer for the budget you actually have to hit.
 TokenCount = Callable[[str], int]
+
+
+@dataclass(frozen=True)
+class StateView:
+    """One request's state, with what it could not carry named instead of totalled.
+
+    The two clipping counts are separate because the pinned context is identical in every
+    shard: a sharded plan counts the pinned clipping once and the candidates' clipping per
+    shard, so `decision.clipped_chars` is characters actually cut and not characters cut
+    times shards. `pinned_ids` are the pinned blocks that reached the state, in transcript
+    order — a count alone cannot tell a caller that the goal was the block that did not fit.
+    """
+
+    state: dict[str, Any]
+    clipped_pinned: int
+    clipped_blocks: int
+    pinned_ids: tuple[str, ...]
+
+    @property
+    def clipped_chars(self) -> int:
+        """Characters cut out of this one state, pinned context and candidates together."""
+        return self.clipped_pinned + self.clipped_blocks
+
+    @property
+    def pinned_shown(self) -> int:
+        """How many pinned blocks fit the room the state gives them."""
+        return len(self.pinned_ids)
 
 
 @dataclass(frozen=True)
@@ -423,13 +490,18 @@ class Plan:
     shards: tuple[Shard, ...]
     unjudged: tuple[str, ...] = ()
     clipped_chars: int = 0
-    pinned_shown: int = 0
+    pinned_in_state: tuple[str, ...] = ()
     pinned_total: int = 0
 
     @property
     def requests(self) -> list[tuple[Any, Mapping[str, Any]]]:
         """(state, questions) pairs, ready for `jev.ask` or `AsyncJev.map`."""
         return [(shard.state, shard.questions) for shard in self.shards]
+
+    @property
+    def pinned_shown(self) -> int:
+        """How many pinned blocks reached the state every shard carries."""
+        return len(self.pinned_in_state)
 
 
 @dataclass(frozen=True)
@@ -460,11 +532,26 @@ class CompactionDecision:
     steered: tuple[str, ...] = ()
     unjudged: tuple[str, ...] = ()
     clipped_chars: int = 0
-    pinned_shown: int = 0
+    pinned_in_state: tuple[str, ...] = ()
     pinned_total: int = 0
     shards: int = 0
     latencies_ms: tuple[float, ...] = ()
     detail: str = ""
+
+    @property
+    def pinned_shown(self) -> int:
+        """How many pinned blocks the model saw as context."""
+        return len(self.pinned_in_state)
+
+    @property
+    def pinned_omitted(self) -> tuple[str, ...]:
+        """Pinned blocks that did not fit the state, so nothing was judged against them.
+
+        They were still kept — pinned blocks are never dropped — but a decision made without
+        the goal in view is weaker evidence, and this is how a caller notices. The answer is
+        to pin less, or to raise `PINNED_STATE_TOKENS`.
+        """
+        return tuple(block_id for block_id in self.pinned if block_id not in self.pinned_in_state)
 
     @property
     def fits(self) -> bool:
@@ -511,8 +598,11 @@ class CompactionDecision:
             parts.append(f"{len(self.unjudged)} unjudged")
         if self.steered:
             parts.append(f"{len(self.steered)} flagged as steering the compactor")
-        if self.pinned_total and self.pinned_shown < self.pinned_total:
-            parts.append(f"{self.pinned_shown}/{self.pinned_total} pinned blocks shown as context")
+        if self.pinned_omitted:
+            parts.append(
+                f"{self.pinned_shown}/{self.pinned_total} pinned blocks shown as context "
+                f"(not shown: {', '.join(self.pinned_omitted)})"
+            )
         if self.clipped_chars:
             parts.append(f"{self.clipped_chars} chars clipped from the state")
         if self.shards > 1:
@@ -525,21 +615,24 @@ class CompactionDecision:
 def plan(transcript: Transcript) -> Plan:
     """The requests this transcript needs: one, or a bounded number of shards.
 
-    Candidates are packed in transcript order until a shard hits `MAX_BLOCKS_PER_SHARD` or
-    the documented per-request token budgets. Oldest first, so if `MAX_SHARDS` truncates
-    the plan the blocks left unjudged are the newest ones — which recency would have kept
-    anyway.
+    Candidates are packed in transcript order until a shard reaches the documented
+    per-request token budgets (less `SHARD_TOKEN_RESERVE`), or the count ceiling those
+    budgets imply. Oldest first, so if `MAX_SHARDS` truncates the plan the blocks left
+    unjudged are the newest ones — which recency would have kept anyway.
+
+    The pinned context is the same in every shard, so its clipping is counted once here and
+    only the candidates' clipping is summed per shard.
     """
-    base_state, _, _ = build_state(transcript)
-    base = limits.estimate_tokens(base_state)
+    base_view = build_state(transcript)
+    base = limits.estimate_tokens(base_view.state)
 
     groups: list[list[str]] = []
     current: list[str] = []
     state_tokens = 0
     question_tokens = 0
     for label in transcript.labels:
-        entry_state, _, _ = build_state(transcript, [label])
-        entry_cost = max(1, limits.estimate_tokens(entry_state) - base)
+        entry_view = build_state(transcript, [label])
+        entry_cost = max(1, limits.estimate_tokens(entry_view.state) - base)
         entry_questions = sum(
             limits.estimate_tokens(question) for question in build_questions([label]).values()
         )
@@ -560,18 +653,18 @@ def plan(transcript: Transcript) -> Plan:
     kept_groups = groups[:MAX_SHARDS]
     unjudged = tuple(label for group in groups[MAX_SHARDS:] for label in group)
     shards: list[Shard] = []
-    clipped = 0
-    pinned_shown = 0
+    clipped = base_view.clipped_pinned
     for index, group in enumerate(kept_groups):
-        state, cut, shown = build_state(transcript, group, shard=index, shards=len(kept_groups))
-        clipped += cut
-        pinned_shown = shown
-        shards.append(Shard(labels=tuple(group), state=state, questions=build_questions(group)))
+        view = build_state(transcript, group, shard=index, shards=len(kept_groups))
+        clipped += view.clipped_blocks
+        shards.append(
+            Shard(labels=tuple(group), state=view.state, questions=build_questions(group))
+        )
     return Plan(
         shards=tuple(shards),
         unjudged=unjudged,
         clipped_chars=clipped,
-        pinned_shown=pinned_shown,
+        pinned_in_state=base_view.pinned_ids,
         pinned_total=len(transcript.pinned),
     )
 
@@ -734,7 +827,7 @@ def decide(
         steered=tuple(item.block_id for item in judgements if item.steered),
         unjudged=tuple(item.block_id for item in judgements if not item.judged),
         clipped_chars=notes.clipped_chars if notes else 0,
-        pinned_shown=notes.pinned_shown if notes else len(pinned_ids),
+        pinned_in_state=notes.pinned_in_state if notes else pinned_ids,
         pinned_total=len(pinned_ids),
         shards=len(replies),
         latencies_ms=tuple(item.latency_ms for item in replies),
@@ -767,7 +860,7 @@ def keep_everything(
         tokens_after=total,
         tokens=sizes,
         pinned_total=len(transcript.pinned),
-        pinned_shown=len(transcript.pinned),
+        pinned_in_state=tuple(block.id for block in transcript.pinned),
         detail=detail,
     )
 
@@ -800,10 +893,13 @@ def compact(
         )
     try:
         prepared = plan(transcript)
-        # One request per decision. More than one only when the candidates cannot fit one
-        # request's state budget: each shard judges different blocks against the same
-        # pinned context and the answers are merged in code. No shard's questions depend
-        # on another shard's answer, so this is never a follow-up round trip.
+        # One request per decision. `plan()` sends a second only when the candidates and
+        # their questions do not fit one request's documented budget less
+        # `SHARD_TOKEN_RESERVE` — or the block count that budget implies,
+        # `MAX_BLOCKS_PER_SHARD`, which is derived from it and never smaller. Each shard
+        # judges different blocks against the same pinned context and the answers are merged
+        # in code; no shard's questions depend on another shard's answer, so this is never a
+        # follow-up round trip.
         replies = [jev.ask(state, questions, model=model) for state, questions in prepared.requests]
     except JevkitError as refused:
         return keep_everything(
@@ -839,7 +935,9 @@ async def compact_async(
         )
     try:
         prepared = plan(transcript)
-        # Same rule as `compact`: one request, or independent shards merged in code.
+        # Same rule as `compact`: one request unless the documented per-request budget
+        # (less `SHARD_TOKEN_RESERVE`) cannot hold the candidates, then independent shards
+        # merged in code.
         replies = await jev.map(prepared.requests, model=model)
     except JevkitError as refused:
         return keep_everything(
@@ -923,8 +1021,9 @@ def expected_cost(
 
     `usd_per_token` is what the caller's own model charges per input token — this recipe
     has no opinion about it. `reuses` is how many later requests send the compacted
-    context. `jev_usd` should come from `jev_usd_from(ledger)` so the fee is measured
-    rather than assumed.
+    context. `jev_usd` should come from `jev_usd_from(ledger, shards=decision.shards)` so the
+    fee is measured rather than assumed, and so a sharded compaction is charged for every
+    request it spent.
     """
     price = float(usd_per_token)
     if price < 0:
@@ -942,12 +1041,18 @@ def expected_cost(
     )
 
 
-def jev_usd_from(ledger: Ledger) -> float:
-    """Jev's measured cost per compaction: this ledger's dollars over its calls.
+def jev_usd_from(ledger: Ledger, *, shards: int = 1) -> float:
+    """Jev's measured fee for **one compaction**: this ledger's dollars per call, times its shards.
 
-    Refuses an empty ledger and one holding replies from an unpriced model, because the
-    point of this number is that nobody made it up. Divide by calls, not by compactions: a
-    sharded compaction spent several calls and should be charged for all of them.
+    `expected_cost` charges the fee once against a saving that is charged back on every
+    reuse, so the fee it needs is what one whole compaction cost — and a sharded compaction
+    spent `shards` calls. Pass `shards=decision.shards`; the default of 1 is the unsharded
+    case. Dividing by calls alone would report a per-*request* average and understate a
+    sharded compaction by exactly the shard count, which halves `break_even_reuses` for a
+    two-shard run.
+
+    Refuses an empty ledger and one holding replies from an unpriced model, because the point
+    of this number is that nobody made it up.
     """
     if not ledger.calls:
         raise ValueError("an empty ledger has no cost per request; compact something first")
@@ -956,4 +1061,11 @@ def jev_usd_from(ledger: Ledger) -> float:
             f"{ledger.unpriced} of {ledger.calls} replies came from a model with no price in "
             "jevkit.cost, so the average would understate the fee; add the price and re-run"
         )
-    return ledger.usd / ledger.calls
+    if shards < 1:
+        raise ValueError(f"a compaction spends at least one request, got shards={shards!r}")
+    if shards > ledger.calls:
+        raise ValueError(
+            f"this ledger holds {ledger.calls} call(s), so it cannot have paid for a "
+            f"{shards}-shard compaction; pass the ledger the compaction was measured on"
+        )
+    return ledger.usd / ledger.calls * shards

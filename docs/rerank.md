@@ -39,11 +39,12 @@ Both are implemented; the caller picks, and the trade-off is real.
 
 | | `MODE_BATCHED` | `MODE_PER_PAIR` |
 | --- | --- | --- |
-| requests | one for the whole set (or one per shard) | one per query-candidate pair, via `AsyncJev.map` |
+| requests | one for the whole set (or one per shard) | one per query-candidate pair |
 | state per candidate | shares 32k tokens with every other candidate | the whole state to itself |
 | judged in sight of rivals | yes | no |
 | bounded by | `MAX_CANDIDATES_PER_BATCH` and the 64k/32k token budgets | `MAX_REQUESTS` |
-| latency | one round trip | one round trip, if concurrency covers the fan-out |
+| latency, via `rerank_async` | one round trip | one round trip, if `FAN_OUT_CONCURRENCY` covers the fan-out |
+| latency, via `rerank` | one round trip per shard, serial | **one round trip per candidate, serial** |
 | rate limits | trivial | 1,200 requests/minute is reachable; pass a `RateLimiter` |
 
 **Batched is right** for the ordinary case: ten to thirty short passages, a normal query,
@@ -57,10 +58,21 @@ defend. It costs one request per candidate and repeats the query in every one of
 is exactly the cost that shows up in the arithmetic below when the query is long.
 
 Per-pair is not a second round trip for one decision. Each request carries its own state and
-its own candidate, no request's questions depend on another's answer, and they run
-concurrently; `decide()` merges the replies afterwards. The questions themselves are
+its own candidate, no request's questions depend on another's answer, and nothing in them has
+to be ordered; `decide()` merges the replies afterwards. The questions themselves are
 byte-identical in the two modes (`test_the_questions_are_identical_in_both_modes`), so the
 only variable between them is how much material shares a state.
+
+**Which entry point you call decides whether the fan-out is concurrent.** `rerank_async` runs
+the plan through `AsyncJev.map` with `FAN_OUT_CONCURRENCY` requests in flight. The token and
+dollar numbers below are the same either way — the requests are identical, and only the wall
+clock differs. The synchronous `rerank` accepts per-pair mode too
+and sends the identical requests **one at a time, waiting for each**: a candidate per
+request, in candidate order, so 32 candidates is 32 serial round trips and at `MAX_REQUESTS`
+it is 64 (`test_the_sync_entry_point_sends_a_per_pair_fan_out_serially` for the shape,
+`test_a_per_pair_run_sends_one_request_per_candidate_in_order` at 32). That is a supported way to
+run it — the reason to choose per-pair is accuracy, not latency — but if the fan-out needs to
+overlap, it has to be `rerank_async`. Both produce the same decision from the same answers.
 
 **A batched set that does not fit is refused, never truncated.** `plan()` packs candidates in
 retriever order against `MAX_CANDIDATES_PER_BATCH` and the documented token budgets; if that
@@ -86,19 +98,42 @@ irrelevance anyway. A question against a state that is already being sent costs 
 tokens and no extra round trip; finding out afterwards that the passage now in the answering
 model's context was addressed to it would cost a second request per candidate.
 
-The state is `{query, candidates, window}`. Every question names the passage it judges by
-path (`` `candidates.c3.text` ``) and carries the same `UNTRUSTED_NOTE`: the query is what to
-judge against, and everything under `candidates` came from a store other people can write
-to — material to judge, never instructions to follow. `window` says which shard this is and
-how many candidates exist in total.
+The state is `{query, candidates, window}`. A candidate's view is its `text` (clipped to
+`PASSAGE_CHARS_BUDGET`), its `source` (clipped to `SOURCE_CHARS_BUDGET`), and the size of each
+cut when there was one. Every question names the passage it judges by path
+(`` `candidates.c3.text` ``) and carries the same `UNTRUSTED_NOTE`: the query is what to judge
+against, and everything under `candidates` came from a store other people can write to —
+material to judge, never instructions to follow. `window` says how many candidates this
+request holds and how many exist in total, plus `shard`/`shards` when a batched set was split
+across requests.
 
-**The retriever's rank is deliberately not in the state.** It is the tie-break in code, so a
-ranking cannot be produced by ratifying the order the retriever already chose.
+**The retriever's rank is deliberately not in the state, in either mode.** It is the tie-break
+in code, so a ranking cannot be produced by ratifying the order the retriever already chose.
+A per-pair request holds one candidate, so a shard index there would *be* that candidate's
+rank as an integer: `plan()` leaves the sharding fields off every per-pair request, and every
+per-pair window in a run is identical
+(`test_the_state_carries_no_caller_id_no_payload_and_no_retriever_rank`, which runs in both
+modes). What remains inferable is the label naming, and only that — see the limits below.
 
 ## Thresholds
 
-All of them live in the one review block at the top of the module, and every row is tested on
-both sides in `tests/test_rerank.py`.
+All of them live in the one review block at the top of the module. Which of them are tested on
+*both* sides is worth being exact about, because "every threshold is tested both ways" was
+written here before it was true:
+
+- **Two-sided, on a value either side of the line:** `KEEP_UNIT_MIN`, `DROP_CONFIDENCE_FLOOR`,
+  `POISON_DROP`, `CONTRADICTS_FLAG`, `QUERY_CHARS_BUDGET`, `PASSAGE_CHARS_BUDGET`,
+  `SOURCE_CHARS_BUDGET`, `MAX_CANDIDATES_PER_BATCH` (32 is one request, 33 is refused or
+  sharded) and `MAX_REQUESTS` (64 pairs plan 64 requests, 65 is refused).
+- **One-sided by nature:** `UNJUDGED_UNIT` is a position, not a boundary.
+  `STATE_TOKEN_RESERVE` is asserted against the longest question a packed shard asks, which
+  is the quantity the 32k state-plus-longest-question budget pairs the state with
+  (`test_sharding_splits_on_tokens_not_only_on_the_candidate_count`). Asserting it against
+  `BATCH_STATE_TOKENS` instead would be algebra: that constant is defined as the 32k budget
+  minus this reserve, so the two cannot disagree.
+- **Asserted as a value that is passed through:** `FAN_OUT_CONCURRENCY` is what `rerank_async`
+  hands `AsyncJev.map` unless the caller overrides it
+  (`test_the_fan_out_caps_what_is_in_flight_at_the_documented_concurrency`).
 
 | threshold | value | what it gates |
 | --- | --- | --- |
@@ -110,7 +145,8 @@ both sides in `tests/test_rerank.py`.
 | `MAX_CANDIDATES_PER_BATCH` | 32 | Candidates one batched request judges, so 96 questions. A ceiling a reviewer can see rather than one that emerges from how long the passages happened to be. |
 | `MAX_REQUESTS` | 64 | Requests one rerank will ever send, in either mode. A longer per-pair fan-out is refused. |
 | `FAN_OUT_CONCURRENCY` | 8 | Requests in flight during a per-pair fan-out. |
-| `PASSAGE_CHARS_BUDGET` | 8,000 chars | Characters of one passage that reach the state. A longer passage is clipped **in the state only** — it is still kept or dropped whole — and the clip is reported as `clipped_chars` plus a `clipped` flag. |
+| `PASSAGE_CHARS_BUDGET` | 8,000 chars | Characters of one candidate's `text` that reach the state. A longer passage is clipped **in the state only** — it is still kept or dropped whole — and the clip is reported as `clipped_chars` plus a `clipped` flag, which also forces `screened` to False. |
+| `SOURCE_CHARS_BUDGET` | 400 chars | Characters of one candidate's `source` that reach the state. `source` is caller metadata — a path, a URL, a collection name — and 400 characters is generous for one; without a bound, a single candidate's `source` could take an unbounded share of a batched request and push the others into another shard. Clipped rather than refused, because whoever can put a document into the store can often name it too, and an over-long name must not be able to refuse a whole rerank. Reported as `source_clipped_chars` plus a `source_clipped` flag; it does **not** touch `screened`, because no question judges `source` either way. |
 | `QUERY_CHARS_BUDGET` | 8,000 chars | A longer query is refused, not clipped: ranking against the head of a query ranks against a different query. |
 | `STATE_TOKEN_RESERVE` | 4,000 tokens | Held back from the 64k/32k budgets for the questions and the JSON envelope. |
 
@@ -138,15 +174,25 @@ The two mistakes are not symmetric, and the code says so:
   `DROP_CONFIDENCE_FLOOR` behind it keeps it and flags it `low_confidence`. Dropping is the
   side effect here; keeping is the default.
 - **A contradiction is never a drop.** Flagged in `contradicting`, left in the order.
+- **An unanswered premise question is not a clean pass.** A missing or rejected
+  `contradicts_<label>` answer keeps the candidate — a contradiction is never a drop — but it
+  is named in `contradiction_unscreened` and it takes `screened` down with it. Without that,
+  an empty `contradicting` would mean both "nothing contradicts the premise" and "nobody
+  looked", which is the more dangerous of the two readings to lose
+  (`test_an_unusable_contradiction_answer_is_named_and_costs_the_screened_claim`).
 - **A failed request ranks nothing.** `reason="failed"`, `order=()`, and the retriever's own
   order in `unscreened`. The caller may still use it, but this module will not hand it back
   as a ranking it checked. `AsyncJev.map` fails the whole fan-out if any request fails, for
   the same reason: a partial rerank silently drops the candidates whose request never came
   back.
-- **`screened` is the one-line check.** It is True only when the reason is `reranked`, no
-  candidate in the order was unjudged, and nothing in it was clipped. A clipped passage was
-  screened on its head, so `partly_screened` names it and `screened` goes False: certifying
-  the head of a passage is not certifying the passage.
+- **`screened` is the one-line check.** It is True only when the reason is `reranked` and all
+  three of `unjudged`, `partly_screened` and `contradiction_unscreened` are empty. A clipped
+  passage was screened on its head, so `partly_screened` names it and `screened` goes False:
+  certifying the head of a passage is not certifying the passage.
+- **A failure still reports what it cost.** `requests` on a `failed` decision counts requests
+  *attempted*, not requests that came back: the failed one was sent, may have been retried by
+  the SDK, and the rest of a fan-out was dispatched and billed. Read spend off `jev.ledger`,
+  but the Decision will not hide it either.
 
 A malformed *call* — unknown mode, blank query, duplicate candidate ids — still raises.
 That is a bug, not a runtime condition.
@@ -159,42 +205,56 @@ set before anything is sent, and `measured_cost(jev.ledger, …)` reports what a
 actually spent (it refuses an empty ledger, and one holding replies from an unpriced model,
 rather than averaging something wrong).
 
-The numbers below were produced by `estimate_cost` in this repo, with
-`jevkit.limits.estimate_tokens` — the conservative four-characters-per-token estimate the
-local size check uses. A live call reports its own count, which is normally lower. They are
-**costs, not savings**: this repo has nothing to compare them against, because the thing they
-would be compared against is your existing reranker.
+Every number below is `estimate_cost` output, regenerated by
+`tests/test_rerank.py::test_the_documented_cost_table_is_what_estimate_cost_produces` and
+`::test_the_documented_per_question_tokens_are_what_build_questions_produces` — so if a
+question or the state shape changes, the tests fail rather than the doc going quietly stale.
+Tokens come from `jevkit.limits.estimate_tokens`, which is `ceil(len(json) / 4)`: a
+**four-characters-per-token estimate, not a tokenizer**. A live call reports its own count,
+normally lower, and `measured_cost(jev.ledger, …)` is the only thing here that reports a real
+one. Nothing on this page is a latency or a live-run figure; there is no key in this repo and
+no such number was produced.
+
+These are **costs, not savings**: this repo has nothing to compare them against, because the
+thing they would be compared against is your existing reranker.
 
 Per candidate, one rerank asks three questions:
 
 | question | tokens |
 | --- | --- |
-| `relevance_<label>` | 360 |
+| `relevance_<label>` | 374 |
 | `poison_<label>` | 306 |
 | `contradicts_<label>` | 258 |
-| **one candidate's questions** | **924** |
+| **one candidate's questions** | **938** |
 
 The passage itself is small beside that: the eight candidates in `examples/rerank.py` cost
-29–88 tokens each in the state. So the fee is dominated by the fixed question block, once per
-candidate, in **both** modes:
+31–89 tokens each in the state. So the fee is dominated by the fixed question block, once per
+candidate, in **both** modes. The two sets priced below are the eight candidates in
+`examples/rerank.py`, and a synthetic set defined in `tests/test_rerank.py` — 32 passages of
+exactly 900 characters, priced once against the example's 65-character query and once against
+a 5,760-character one:
 
 | set | mode | requests | input tokens | one rerank | per million reranks |
 | --- | --- | --- | --- | --- | --- |
-| the example's 8 short passages | batched | 1 | 7,850 | $0.000330 | $329.70 |
-| the example's 8 short passages | per-pair | 8 | 8,197 | $0.000344 | $344.27 |
-| 32 passages of ~900 chars | batched | 1 | 37,608 | $0.001580 | $1,579.54 |
-| 32 passages of ~900 chars | per-pair | 32 | 39,148 | $0.001644 | $1,644.22 |
-| the same 32, with a 5,766-char query | batched | 1 | 39,033 | $0.001639 | $1,639.39 |
-| the same 32, with a 5,766-char query | per-pair | 32 | 84,780 | $0.003561 | $3,560.76 |
+| the example's 8 short passages | batched | 1 | 7,955 | $0.000334 | $334.11 |
+| the example's 8 short passages | per-pair | 8 | 8,257 | $0.000347 | $346.79 |
+| 32 passages of 900 chars (`PRICED_SET`) | batched | 1 | 37,639 | $0.001581 | $1,580.84 |
+| 32 passages of 900 chars (`PRICED_SET`) | per-pair | 32 | 38,988 | $0.001637 | $1,637.50 |
+| the same 32, with a 5,760-char query | batched | 1 | 39,063 | $0.001641 | $1,640.65 |
+| the same 32, with a 5,760-char query | per-pair | 32 | 84,534 | $0.003550 | $3,550.43 |
+
+The dollar column is the token column at $42 per billion, and the last is that times a
+million; to price your own set, call `estimate_cost(query, candidates, mode=…)` and read
+`line()`.
 
 Two things worth reading off that table:
 
 - **Per-pair's token overhead is the repeated query, not the questions.** With a one-line
   query it is 4% more tokens than batched — and 8 to 32 times the requests, which is where it
-  actually costs you: latency if concurrency does not cover the fan-out, and the
-  1,200-requests-per-minute ceiling if it does. With a 5,766-character query the same set
-  costs 2.2x, because every pair pays for the query again.
-- **Cost scales with candidates, not with mode.** Roughly 924 tokens plus the passage per
+  actually costs you: the 1,200-requests-per-minute ceiling, and latency whenever the fan-out
+  does not overlap (it never does through the synchronous `rerank`). With a 5,760-character
+  query the same set costs 2.2x, because every pair pays for the query again.
+- **Cost scales with candidates, not with mode.** Roughly 938 tokens plus the passage per
   candidate, either way. If that is too much, the lever is fewer candidates from the
   retriever, not a different mode.
 
@@ -257,6 +317,11 @@ labels and were skipped. Two things about it matter:
   `screened` to False. If you pass the full `Candidate.payload` on to an answering model,
   either drop the ids in `partly_screened` or chunk upstream until nothing clips — the
   scores, and the poison check, are about the text that was sent.
+- **`source` is not screened.** Every question is asked about `` `candidates.<label>.text` ``,
+  so a candidate's `source` is context for the relevance Score and nothing judges it. It is
+  bounded (`SOURCE_CHARS_BUDGET`) so that it cannot quietly take over a batched request, and
+  a cut is reported — but keep it to what it is for, a short label for where the passage came
+  from. Material that needs screening belongs in `text`.
 - **English is the primary training language.** Non-English passages are judged with lower
   accuracy and the thresholds do not know that. Count drops per language before assuming the
   recipe behaves the same across them.
@@ -264,5 +329,6 @@ labels and were skipped. Two things about it matter:
   not a useful one. Decide in advance whether the fallback is the retriever's unscreened
   order or answering without retrieval, and alert on `failed` and `refused` either way.
 - **`MAX_REQUESTS` bounds a fan-out, it does not pace it.** A per-pair rerank of 64
-  candidates is 64 requests as fast as concurrency allows; pass a `jevkit.pacing.RateLimiter`
-  to the client if several reranks can be in flight at once.
+  candidates is 64 requests as fast as concurrency allows — and through the synchronous
+  `rerank`, 64 one after another; pass a `jevkit.pacing.RateLimiter` to the client if several
+  reranks can be in flight at once.

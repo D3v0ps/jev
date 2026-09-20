@@ -10,9 +10,11 @@ how often that happens depends on the latency you actually get. One tick also pu
 override instruction on a sign in front of the camera, to show the loop holding rather
 than obeying its own input.
 
-Every number printed at the end is measured by this run — the achieved tick rate, the
-latency percentiles, the deadline misses, and the dollars — and the last line is the
-account arithmetic a fleet of these robots would have to live inside.
+Every number printed at the end is measured by this run — the tick cadence, the rate of
+moves actually chosen, the latency percentiles, the deadline misses, and the dollars — and
+the last line is the account arithmetic a fleet of these robots would have to live inside.
+`report.sustains()` only holds if the loop *decided* at its target rate with no missed
+deadline and no stale drop, so a run that held every tick reports False.
 """
 
 from __future__ import annotations
@@ -115,6 +117,9 @@ async def main() -> None:
                     goal=GOAL,
                     plan=PLAN,
                     committing=COMMITTING,
+                    # The fixed enum, so `next_move` offers only its keys, whatever
+                    # `legal` happens to contain this tick.
+                    catalogue=MOVES,
                 ),
                 ticks=TICKS,
                 act=world.act,
@@ -128,7 +133,10 @@ async def main() -> None:
     print(f"\nmoves executed: {' '.join(world.moves)}")
     print(f"loop:   {report.summary()}")
     print(f"ledger: {jev.ledger.summary()}")
-    print(f"target: sustains {report.achieved_rate:.1f}/s measured, hypothesis holds: {report.sustains()}")
+    print(
+        f"target: {report.chosen_rate:.1f}/s moves chosen of {report.achieved_rate:.1f}/s ticks, "
+        f"hypothesis holds: {report.sustains()}"
+    )
     print(f"fleet:  {Account(loops=1).line()}")
 
 

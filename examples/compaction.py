@@ -20,18 +20,22 @@ which is the only reason three questions per block is affordable.
 
 from __future__ import annotations
 
-from jevkit import Jev, limits
+from jevkit import Jev, cost, limits
 from jevkit.recipes.compaction import (
     Block,
     Transcript,
     build_questions,
     build_state,
     compact,
+    depends_id,
     expected_cost,
     jev_usd_from,
     kept_blocks,
     plan,
+    steering_id,
+    value_id,
 )
+from jevkit.testing import fake_jev
 
 #: The context, oldest first. `pinned=True` means "not part of the decision": the system
 #: prompt, the standing goal and the live user message are never offered for dropping.
@@ -133,8 +137,8 @@ def count(text: str) -> int:
     return limits.estimate_tokens(text)
 
 
-def request_tokens() -> dict[str, int]:
-    """Estimated input tokens for this decision, in one request and in two per-block shapes.
+def request_tokens(transcript: Transcript = TRANSCRIPT) -> dict[str, int]:
+    """Estimated input tokens for one decision, in one request and in two per-block shapes.
 
     Every number comes from `jevkit.limits.estimate_tokens` over requests this module would
     actually send, so they are estimates of request size, not metered usage. The three
@@ -146,25 +150,157 @@ def request_tokens() -> dict[str, int]:
       says this", because it never sees the other blocks.
     - `per_block_informed`: one request per block, each carrying the whole transcript, which
       is the only per-block shape with the same information as `one`.
+
+    `transcript` is an argument so the shapes table in `docs/compaction.md` has a producer
+    that lives in this repo: see `shapes()` below.
     """
-    labels = list(TRANSCRIPT.labels)
+    labels = list(transcript.labels)
     per_question = sum(limits.estimate_tokens(q) for q in build_questions(["b0"]).values())
+    prepared = plan(transcript)
     one = sum(
         limits.estimate_tokens(state) + sum(limits.estimate_tokens(q) for q in questions.values())
-        for state, questions in plan(TRANSCRIPT).requests
+        for state, questions in prepared.requests
     )
     lean = 0
     for label in labels:
-        state, _, _ = build_state(TRANSCRIPT, [label])
-        lean += limits.estimate_tokens(state) + per_question
-    whole, _, _ = build_state(TRANSCRIPT, labels)
+        lean += limits.estimate_tokens(build_state(transcript, [label]).state) + per_question
+    whole = build_state(transcript, labels).state
     return {
         "one": one,
         "per_block_lean": lean,
         "per_block_informed": len(labels) * (limits.estimate_tokens(whole) + per_question),
         "questions_per_block": per_question,
         "blocks": len(labels),
+        "shards": len(prepared.shards),
     }
+
+
+def uniform_transcript(blocks: int, tokens_each: int) -> Transcript:
+    """A synthetic transcript: one pinned goal and `blocks` candidates of equal size.
+
+    The text is filler on purpose — these shapes exist to size a *request*, and request size
+    depends on how many characters of block go into the state, not on what they say.
+    """
+    filler = "x" * (tokens_each * limits.CHARS_PER_TOKEN)
+    return Transcript(
+        [
+            Block("goal", "Goal: reconcile the invoice.", role="user", pinned=True),
+            *[Block(f"b{index}", filler, role="tool") for index in range(blocks)],
+        ]
+    )
+
+
+#: The shapes `docs/compaction.md` tabulates: this file's transcript, then three synthetic
+#: ones. Each is (label, blocks, tokens per block) and is rebuilt by `shapes()` below, so no
+#: number in that table is typed in by hand.
+DOC_SHAPES = (
+    ("12 blocks, ~2,000 tokens each", 12, 2_000),
+    ("40 blocks, ~400 tokens each", 40, 400),
+    ("80 blocks, ~100 tokens each", 80, 100),
+)
+
+
+def _this_file_shape() -> str:
+    """The row label for this file's own transcript, measured rather than written down."""
+    candidates = [block for block in TRANSCRIPT.blocks if not block.pinned]
+    total = sum(limits.estimate_tokens(block.text) for block in candidates)
+    each = total / len(candidates) if candidates else 0
+    return f"{len(TRANSCRIPT.labels)} blocks, ~{each:.0f} tokens each (this file)"
+
+
+def shapes() -> list[dict[str, object]]:
+    """`request_tokens` for this file's transcript and for each shape in `DOC_SHAPES`."""
+    rows: list[dict[str, object]] = []
+    for name, transcript in [
+        (_this_file_shape(), TRANSCRIPT),
+        *[(name, uniform_transcript(blocks, each)) for name, blocks, each in DOC_SHAPES],
+    ]:
+        shape = request_tokens(transcript)
+        rows.append(
+            {
+                "shape": name,
+                "one": shape["one"],
+                "shards": shape["shards"],
+                "lean_ratio": shape["per_block_lean"] / shape["one"],
+                "informed_ratio": shape["per_block_informed"] / shape["one"],
+            }
+        )
+    return rows
+
+
+#: What to assume the model answered, per block id, as (value level, depends, steering), for
+#: the offline numbers in `docs/compaction.md`. Written out rather than sampled: these are a
+#: plausible reading of the transcript above, **not** the model's output. Run `main()` with a
+#: key for that. `page` is the block carrying the notice addressed to the compactor.
+DOC_ANSWERS: dict[str, tuple[int, float, float]] = {
+    "ack": (0, 0.02, 0.02),
+    "retry": (0, 0.02, 0.02),
+    "invoice": (3, 0.95, 0.02),
+    "thinking": (2, 0.20, 0.02),
+    "page": (1, 0.30, 0.90),
+    "weather": (0, 0.02, 0.02),
+    "duplicate_check": (3, 0.90, 0.02),
+    "ok": (0, 0.02, 0.02),
+    "restate": (2, 0.30, 0.02),
+    "formatting": (0, 0.05, 0.02),
+    "history": (1, 0.05, 0.02),
+}
+
+
+def offline_run():
+    """This file's decision, decided offline against `DOC_ANSWERS`. No key, no network.
+
+    Returns (decision, ledger, fee). The ledger's input tokens are
+    `jevkit.limits.estimate_tokens` over the request body the SDK really encoded — a
+    ~4-characters-per-token estimate, not a tokenizer — priced by `jevkit.cost`.
+    """
+    scripted: dict[str, object] = {}
+    for block_id, (value, depends, steering) in DOC_ANSWERS.items():
+        label = TRANSCRIPT.label_of[block_id]
+        scripted[value_id(label)] = value
+        scripted[depends_id(label)] = depends
+        scripted[steering_id(label)] = steering
+    client, _ = fake_jev(scripted)
+    try:
+        decision = compact(client, TRANSCRIPT, budget=BUDGET, count=count)
+        return decision, client.ledger, jev_usd_from(client.ledger, shards=decision.shards)
+    finally:
+        client.close()
+
+
+def print_offline_numbers() -> None:
+    """Every number `docs/compaction.md` quotes, recomputed. Offline, so no key is needed:
+
+        .venv/bin/python -c "import examples.compaction as ex; ex.print_offline_numbers()"
+    """
+    print("request size by shape (jevkit.limits.estimate_tokens, not a tokenizer)")
+    for row in shapes():
+        print(
+            f"  {row['shape']:<38} one request ~{row['one']} tokens in {row['shards']} "
+            f"shard(s) · per-block lean {row['lean_ratio']:.2f}x · "
+            f"per-block informed {row['informed_ratio']:.2f}x"
+        )
+
+    decision, ledger, fee = offline_run()
+    shape = request_tokens()
+    price = cost.per_million("jev-latest")
+    print("\nworked example (answers from DOC_ANSWERS above, not from the model)")
+    print(f"  transcript          {decision.tokens_before} estimated tokens, "
+          f"{len(TRANSCRIPT.blocks)} blocks, {decision.pinned_total} pinned")
+    print(f"  budget              {BUDGET} tokens")
+    print(f"  questions per block ~{shape['questions_per_block']} estimated tokens")
+    print(f"  request             {ledger.calls}, {ledger.input_tokens} estimated input tokens")
+    print(f"  fee                 ${fee:.6f} at ${price:.3f}/Mtok")
+    print(f"  kept / dropped      {len(decision.kept)} / {len(decision.dropped)} — "
+          f"{decision.tokens_after} tokens, {decision.saved_tokens} saved "
+          f"({decision.saved_fraction:.0%})")
+    print(f"  dropped             {list(decision.dropped)}")
+    print(f"  kept                {list(decision.kept)}")
+    for label, usd_per_token in (("$3.00/Mtok downstream", 3 / 1e6), ("$0.042/Mtok downstream", 42 / 1e9)):
+        report = expected_cost(decision, usd_per_token=usd_per_token, reuses=1, jev_usd=fee)
+        print(f"  {label:<19} break-even at {report.break_even_reuses:.2f} reuses "
+              f"(saving ${report.saving_usd:.6f} per reuse)")
+    print(f"  line()              {decision.line()}")
 
 
 def main() -> None:
@@ -208,7 +344,7 @@ def main() -> None:
             f"({shape[label] / shape['one']:.2f}x the tokens, {shape['blocks']}x the round trips)"
         )
 
-    fee = jev_usd_from(jev.ledger)
+    fee = jev_usd_from(jev.ledger, shards=decision.shards)
     print(f"\nfee:          ${fee:.6f} per compaction, measured from this run")
     # ILLUSTRATIVE downstream price. Use what your own model charges per input token.
     usd_per_token = 3 / 1e6

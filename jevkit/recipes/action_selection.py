@@ -140,6 +140,16 @@ INJECTION_QUESTION = Noul(
 FLOOR_AT_NO_STAKES = 0.55
 FLOOR_AT_FULL_STAKES = 0.92
 
+#: A Score's mean hides its tail. Half the mass on "Read-only" and half on
+#: "Irreversible" has the same mean as a confident "Reversible", so setting the
+#: floor from the mean alone makes the recipe *most* permissive exactly where the
+#: model is least sure about the one input that governs irreversible side
+#: effects. The floor is therefore also read off the upper tail: the highest
+#: level the answer still puts this much cumulative mass at or above sets the
+#: floor, so uncertainty about how dangerous the screen is resolves upwards.
+#: Lower this to treat a thinner tail as dangerous; 1.0 reduces it to the mean.
+STAKES_TAIL_MASS = 0.15
+
 #: DONE and BLOCKED end the run without touching the screen: a lower bar than
 #: acting, but still a bar, because a premature DONE hides a failure.
 CONTROL_CONFIDENCE_FLOOR = 0.50
@@ -149,7 +159,8 @@ CONTROL_CONFIDENCE_FLOOR = 0.50
 TARGET_MARGIN_MIN = 0.15
 MARGIN_TOP_N = 2
 
-#: Above this, the observation is treated as compromised and nothing is clicked.
+#: At or above this, the observation is treated as compromised and nothing is
+#: clicked. The comparison in `decide` is `>=`, so exactly 0.60 blocks.
 INJECTION_BLOCK = 0.60
 
 #: A DONE below this is downgraded to ASK_OPERATOR: the loop claims success the
@@ -170,6 +181,40 @@ TRIM_MARKER = "…"
 def confidence_floor(stakes: float) -> float:
     """The confidence an element operation must clear, given the stakes in 0..1."""
     return FLOOR_AT_NO_STAKES + (FLOOR_AT_FULL_STAKES - FLOOR_AT_NO_STAKES) * stakes
+
+
+def stakes_tail(probabilities: Mapping[Any, float]) -> float:
+    """The upper tail of the stakes distribution, normalised to 0..1.
+
+    The highest level index whose cumulative mass *from the top* reaches
+    `STAKES_TAIL_MASS`, divided by the top index. Needs no extra question: the
+    Score answer already carries the whole distribution, keyed by level index.
+
+    An unreadable key set returns 1.0 — the most cautious answer available —
+    rather than a low tail that would quietly lower the floor.
+    """
+    top = len(STAKES_LEVELS) - 1
+    mass: dict[int, float] = {}
+    for key, value in probabilities.items():
+        try:
+            mass[int(key)] = float(value)
+        except (TypeError, ValueError):
+            return 1.0
+    cumulative = 0.0
+    for level in range(top, 0, -1):
+        cumulative += mass.get(level, 0.0)
+        if cumulative >= STAKES_TAIL_MASS:
+            return level / top
+    return 0.0
+
+
+def gating_stakes(probabilities: Mapping[Any, float], mean: float) -> float:
+    """The stakes value the acting floor is set from: the worse of mean and tail.
+
+    The mean still counts, because mass spread evenly over the middle levels is
+    a real risk no single tail level captures.
+    """
+    return max(mean, stakes_tail(probabilities))
 
 
 def build_questions(space: ActionSpace) -> dict[str, Any]:
@@ -268,6 +313,11 @@ class Decision:
     A log line built from this explains the call afterwards without re-asking.
     `dropped` and `trimmed` travel with every decision: a candidate that could
     not be offered must never be silently unselectable.
+
+    `stakes` is the Score's normalised mean; `stakes_gate` is the value the floor
+    was actually computed from (see `gating_stakes`). `margin` is the winning
+    target's lead over the runner-up, and is None when the head offered a single
+    candidate and there was no runner-up to lead.
     """
 
     action: str
@@ -279,6 +329,7 @@ class Decision:
     floor: float | None = None
     margin: float | None = None
     stakes: float | None = None
+    stakes_gate: float | None = None
     goal_evidence: float | None = None
     injection: float | None = None
     needs_independent_check: bool = False
@@ -387,13 +438,18 @@ def decide(reply: Reply, space: ActionSpace) -> Decision:
 
     Fails closed. A rejected answer, an operation with no reachable target, a
     confidence below the floor, or two targets too close together all end in
-    ASK_OPERATOR rather than in a click.
+    ASK_OPERATOR rather than in a click. The floor itself fails closed too: an
+    ambiguous stakes answer is read off its upper tail, not its mean, so it
+    cannot buy a click by being undecided about how dangerous the screen is.
     """
     try:
         operation = reply.picked(OPERATION_QUESTION_ID)
         operation_probabilities = reply.probabilities(OPERATION_QUESTION_ID)
         operation_confidence = reply.confidence(OPERATION_QUESTION_ID)
         stakes = reply.unit(STAKES_QUESTION_ID)
+        stakes_distribution = reply.probabilities(STAKES_QUESTION_ID)
+        stakes_upper = stakes_tail(stakes_distribution)
+        stakes_gate = gating_stakes(stakes_distribution, stakes)
         goal_evidence = reply.noul(GOAL_EVIDENCE_QUESTION_ID)
         injection = reply.noul(INJECTION_QUESTION_ID)
     except (AnswerRejected, KeyError) as error:
@@ -403,6 +459,7 @@ def decide(reply: Reply, space: ActionSpace) -> Decision:
         "operation": operation,
         "operation_probabilities": operation_probabilities,
         "stakes": stakes,
+        "stakes_gate": stakes_gate,
         "goal_evidence": goal_evidence,
         "injection": injection,
     }
@@ -500,22 +557,24 @@ def decide(reply: Reply, space: ActionSpace) -> Decision:
         )
 
     confidence = min(operation_confidence, target_confidence)
-    floor = confidence_floor(stakes)
-    margin = ranked[0][1] - ranked[1][1] if len(ranked) > 1 else ranked[0][1]
+    floor = confidence_floor(stakes_gate)
+    # A head with one option has no runner-up, so there is no margin to report.
+    # `None` says that; the top probability would be a 1.00 lead over nothing.
+    margin = ranked[0][1] - ranked[1][1] if len(ranked) > 1 else None
     evidence["target_probabilities"] = target_probabilities
 
     if confidence < floor:
         return _hold(
             ASK_OPERATOR,
             f"{operation} on element {index} at confidence {confidence:.2f} < floor {floor:.2f} "
-            f"for stakes {stakes:.2f}",
+            f"for stakes {stakes_gate:.2f} (mean {stakes:.2f}, upper tail {stakes_upper:.2f})",
             space,
             confidence=confidence,
             floor=floor,
             margin=margin,
             **evidence,
         )
-    if margin < TARGET_MARGIN_MIN:
+    if margin is not None and margin < TARGET_MARGIN_MIN:
         return _hold(
             ASK_OPERATOR,
             f"the two best targets for {operation} are {margin:.2f} apart, under {TARGET_MARGIN_MIN}",
@@ -528,7 +587,10 @@ def decide(reply: Reply, space: ActionSpace) -> Decision:
 
     return Decision(
         action=ACT,
-        reason=f"{operation} on element {index} at confidence {confidence:.2f} (floor {floor:.2f})",
+        reason=(
+            f"{operation} on element {index} at confidence {confidence:.2f} "
+            f"(floor {floor:.2f} for stakes {stakes_gate:.2f})"
+        ),
         target_index=index,
         target=space.candidates[index],
         confidence=confidence,

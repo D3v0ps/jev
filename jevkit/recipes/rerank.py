@@ -41,7 +41,8 @@ two noul values, the retriever's original rank and the drop or flag reasons, so
 the ranking can be scored against the caller's labels afterwards. `screened` is
 False whenever a candidate in `order` was not actually judged in full - including
 one whose text was clipped, because the poison check then read its head and not its
-tail, listed in `partly_screened`. On a failed or refused request `order` is empty
+tail, listed in `partly_screened`, and one whose premise question produced no usable
+answer, listed in `contradiction_unscreened`. On a failed or refused request `order` is empty
 and `unscreened` holds the retriever's order: the caller may still use it, but this
 module will not hand it back as if it had been checked.
 """
@@ -86,6 +87,7 @@ FLAG_CONTRADICTION_UNSCREENED = "contradiction_unscreened"
 FLAG_LOW_CONFIDENCE = "low_confidence"
 FLAG_UNJUDGED = "unjudged"
 FLAG_CLIPPED = "clipped"
+FLAG_SOURCE_CLIPPED = "source_clipped"
 
 #: Question id prefixes, and the label minted for the candidate at retriever rank n.
 #: Question ids are not sent to the model. The labels are this module's own keys, not the
@@ -161,9 +163,16 @@ FAN_OUT_CONCURRENCY = 8
 
 #: Tokens of a request's budget held back for the questions and the JSON envelope.
 STATE_TOKEN_RESERVE = 4_000
-#: Characters of one passage that reach the state. A longer passage is clipped *in the state
-#: only* — it is still kept or dropped whole — and the clip is reported on the Judged.
+#: Characters of one passage's `text` that reach the state. A longer passage is clipped *in the
+#: state only* — it is still kept or dropped whole — and the clip is reported on the Judged.
 PASSAGE_CHARS_BUDGET = 2_000 * limits.CHARS_PER_TOKEN
+#: Characters of one candidate's `source` that reach the state. `source` is caller metadata — a
+#: path, a URL, a collection name — so a hundred tokens is generous; it is clipped rather than
+#: refused because whoever can write a document into the store can often write its path too, and
+#: an over-long path must not be able to refuse a whole rerank. No question judges `source`: the
+#: poison Noul is asked about `candidates.<label>.text`, so a clip here changes what the relevance
+#: Score saw of the label, never what the poison check certified.
+SOURCE_CHARS_BUDGET = 100 * limits.CHARS_PER_TOKEN
 #: A query longer than this is refused, not clipped: reranking against the head of a query
 #: is reranking against a different query.
 QUERY_CHARS_BUDGET = 2_000 * limits.CHARS_PER_TOKEN
@@ -207,21 +216,29 @@ def build_state(
 ) -> dict[str, Any]:
     """The material every question sees: the query, and the candidate passages.
 
-    The retriever's rank is deliberately **not** a field here. It is the tie-break in code,
-    so a ranking cannot be produced by ratifying the order the retriever already chose. The
-    labels are still minted in rank order, so the order is inferable from the key names;
-    `docs/rerank.md` records that as a limit rather than pretending otherwise.
+    The retriever's rank is deliberately **not** a field here, in either mode. It is the
+    tie-break in code, so a ranking cannot be produced by ratifying the order the retriever
+    already chose. The labels are still minted in rank order, so the order is inferable from
+    the key names; `docs/rerank.md` records that as a limit rather than pretending otherwise.
+
+    `shard`/`shards` describe a batched set split across several requests, and they appear
+    only when there is more than one shard. A per-pair request is not a shard of anything —
+    it is one whole decision about one candidate — and with one candidate per request a shard
+    index *is* the retriever's rank, as an integer, which is the one thing this state must not
+    carry. `plan()` therefore leaves the sharding fields off every per-pair request.
     """
+    window: dict[str, Any] = {
+        "mode": mode,
+        "candidates_here": len(views),
+        "candidates_total": len(views) if total is None else total,
+    }
+    if shards > 1:
+        window["shard"] = shard
+        window["shards"] = shards
     return {
         "query": query,
         "candidates": {label: dict(view) for label, view in views.items()},
-        "window": {
-            "mode": mode,
-            "candidates_here": len(views),
-            "candidates_total": len(views) if total is None else total,
-            "shard": shard,
-            "shards": shards,
-        },
+        "window": window,
     }
 
 
@@ -250,7 +267,8 @@ def build_questions(labels: Sequence[str]) -> dict[str, Any]:
                 "judge": (
                     f"Read `{path}` against `query` alone. A `clipped_chars` field means you are "
                     "seeing the head of a longer passage; judge what is there. A `source` field is "
-                    "the caller's own label for where the passage came from."
+                    "the caller's own label for where the passage came from, cut to its head when "
+                    "`source_clipped_chars` is present."
                 ),
                 "note": (
                     "Rate usefulness for answering `query`, not how well written, long, recent or "
@@ -328,6 +346,11 @@ class Candidate:
     whatever the caller wants to carry along — the full untruncated passage, a database row,
     a URL. Neither is serialised into the request, so the model chooses among labels this
     module minted and cannot answer with something the caller would then dereference.
+
+    `text` is the passage and is what every question judges, clipped in the state to
+    `PASSAGE_CHARS_BUDGET`. `source` is a short label for where the passage came from, clipped
+    to `SOURCE_CHARS_BUDGET`; it is context for the relevance Score and no question judges it,
+    so do not put material that needs screening in it.
     """
 
     id: str
@@ -345,6 +368,7 @@ class Entry:
     candidate: Candidate
     view: Mapping[str, Any]
     clipped_chars: int = 0
+    source_clipped_chars: int = 0
 
 
 @dataclass(frozen=True)
@@ -377,6 +401,10 @@ class Plan:
     def clipped_chars(self) -> int:
         return sum(entry.clipped_chars for entry in self.entries)
 
+    @property
+    def source_clipped_chars(self) -> int:
+        return sum(entry.source_clipped_chars for entry in self.entries)
+
 
 @dataclass(frozen=True)
 class Judged:
@@ -399,6 +427,7 @@ class Judged:
     contradicts: float | None = None
     probabilities: Mapping[int, float] = field(default_factory=dict)
     clipped_chars: int = 0
+    source_clipped_chars: int = 0
 
     @property
     def ranking_unit(self) -> float:
@@ -424,6 +453,7 @@ class RerankDecision:
     order: tuple[str, ...] = ()
     dropped: tuple[str, ...] = ()
     contradicting: tuple[str, ...] = ()
+    contradiction_unscreened: tuple[str, ...] = ()
     low_confidence: tuple[str, ...] = ()
     unjudged: tuple[str, ...] = ()
     judged: Mapping[str, Judged] = field(default_factory=dict)
@@ -431,6 +461,7 @@ class RerankDecision:
     requests: int = 0
     shards: int = 0
     clipped_chars: int = 0
+    source_clipped_chars: int = 0
     latencies_ms: tuple[float, ...] = ()
     detail: str = ""
 
@@ -454,10 +485,19 @@ class RerankDecision:
     def screened(self) -> bool:
         """True only when every candidate in `order` was judged, in full, by a validated answer.
 
-        Clipping counts against it: certifying the head of a passage is not
-        certifying the passage.
+        Three things count against it, and each has its own list. `unjudged` — no
+        usable relevance answer. `partly_screened` — the text was clipped, and
+        certifying the head of a passage is not certifying the passage.
+        `contradiction_unscreened` — no usable answer to the premise question, so
+        an empty `contradicting` means "nobody looked" rather than "nothing
+        contradicts the premise".
         """
-        return self.reason == "reranked" and not self.unjudged and not self.partly_screened
+        return (
+            self.reason == "reranked"
+            and not self.unjudged
+            and not self.partly_screened
+            and not self.contradiction_unscreened
+        )
 
     @property
     def ranking(self) -> tuple[Judged, ...]:
@@ -491,12 +531,16 @@ class RerankDecision:
             parts.append(f"{self.shards} shards")
         if self.contradicting:
             parts.append(f"{len(self.contradicting)} contradict the premise")
+        if self.contradiction_unscreened:
+            parts.append(f"{len(self.contradiction_unscreened)} unchecked for contradiction")
         if self.low_confidence:
             parts.append(f"{len(self.low_confidence)} kept on low confidence")
         if self.unjudged:
             parts.append(f"{len(self.unjudged)} unjudged")
         if self.clipped_chars:
             parts.append(f"{self.clipped_chars} chars clipped from the state")
+        if self.source_clipped_chars:
+            parts.append(f"{self.source_clipped_chars} chars clipped from candidate sources")
         if self.partly_screened:
             parts.append(f"{len(self.partly_screened)} screened on their head only")
         if self.unscreened:
@@ -506,15 +550,25 @@ class RerankDecision:
         return " · ".join(parts)
 
 
-def _view(candidate: Candidate) -> tuple[dict[str, Any], int]:
-    """A candidate's state view, and the characters clipped out of its text."""
+def _view(candidate: Candidate) -> tuple[dict[str, Any], int, int]:
+    """A candidate's state view, the characters cut from its text, and those cut from its source.
+
+    Both budgets are enforced here, so no single candidate can silently take an unbounded
+    share of a batched request. The two cuts are reported separately because they do not mean
+    the same thing: the text is what the poison Noul reads, so cutting it leaves part of the
+    passage uncertified, while `source` is caller metadata no question judges either way.
+    """
     cut = max(0, len(candidate.text) - PASSAGE_CHARS_BUDGET)
     view: dict[str, Any] = {"text": candidate.text[:PASSAGE_CHARS_BUDGET]}
+    source_cut = 0
     if candidate.source is not None:
-        view["source"] = candidate.source
+        source_cut = max(0, len(candidate.source) - SOURCE_CHARS_BUDGET)
+        view["source"] = candidate.source[:SOURCE_CHARS_BUDGET]
     if cut:
         view["clipped_chars"] = cut
-    return view, cut
+    if source_cut:
+        view["source_clipped_chars"] = source_cut
+    return view, cut, source_cut
 
 
 def _entry_cost(query: str, entry: Entry, base: int) -> tuple[int, int]:
@@ -529,8 +583,9 @@ def _entry_cost(query: str, entry: Entry, base: int) -> tuple[int, int]:
     ):
         raise RequestTooLarge(
             f"candidate {entry.candidate.id!r} does not fit a request even on its own "
-            f"(~{base + state_tokens + question_tokens} tokens); shorten it or its `source` upstream. "
-            "Nothing was truncated."
+            f"(~{base + state_tokens + question_tokens} tokens). Its text and source are already "
+            "clipped to PASSAGE_CHARS_BUDGET and SOURCE_CHARS_BUDGET, so this means one of those "
+            "budgets, or the query, is too large for one request. Nothing was truncated."
         )
     return state_tokens, question_tokens
 
@@ -600,7 +655,7 @@ def plan(
 
     entries: list[Entry] = []
     for rank, candidate in enumerate(items):
-        view, cut = _view(candidate)
+        view, cut, source_cut = _view(candidate)
         entries.append(
             Entry(
                 label=label_for(rank),
@@ -608,6 +663,7 @@ def plan(
                 candidate=candidate,
                 view=view,
                 clipped_chars=cut,
+                source_clipped_chars=source_cut,
             )
         )
     if not entries:
@@ -633,6 +689,10 @@ def plan(
             f"{MAX_REQUESTS} request ceiling; rerank a shorter candidate list. Nothing was truncated."
         )
 
+    # Only a batched set split in two is sharded. In per-pair mode each request holds one
+    # candidate, so a shard index would be that candidate's retriever rank as an integer —
+    # exactly what build_state keeps out of the state.
+    sharded = mode == MODE_BATCHED and len(groups) > 1
     shards = tuple(
         Shard(
             labels=tuple(entry.label for entry in group),
@@ -640,8 +700,8 @@ def plan(
                 query,
                 {entry.label: entry.view for entry in group},
                 mode=mode,
-                shard=index,
-                shards=len(groups),
+                shard=index if sharded else 0,
+                shards=len(groups) if sharded else 1,
                 total=len(entries),
             ),
             questions=build_questions([entry.label for entry in group]),
@@ -692,6 +752,10 @@ def decide(
     produced no usable answer is dropped, because nothing certified it safe to show. A
     candidate whose *relevance* answer is missing, rejected, or low but unconfident is kept
     and flagged, because dropping a passage is the side effect here and keeping one is not.
+    A candidate whose *contradiction* answer is missing or rejected is kept as well — a
+    contradiction is never a drop — but it lands in `contradiction_unscreened`, which makes
+    `screened` False: an empty `contradicting` must not read as "nothing contradicts the
+    premise" when the truth is that nothing answered.
     The order is `sorted()` on normalised relevance with the retriever's rank as the
     tie-break, so identical answers always produce an identical order.
     """
@@ -738,6 +802,8 @@ def decide(
                 reasons.append(FLAG_CONTRADICTS)
         if entry.clipped_chars:
             reasons.append(FLAG_CLIPPED)
+        if entry.source_clipped_chars:
+            reasons.append(FLAG_SOURCE_CLIPPED)
 
         judged[entry.candidate.id] = Judged(
             candidate_id=entry.candidate.id,
@@ -752,6 +818,7 @@ def decide(
             contradicts=contradicts,
             probabilities=probabilities,
             clipped_chars=entry.clipped_chars,
+            source_clipped_chars=entry.source_clipped_chars,
         )
 
     ranked = sorted(
@@ -777,6 +844,11 @@ def decide(
         contradicting=tuple(
             record.candidate_id for record in ranked if FLAG_CONTRADICTS in record.reasons
         ),
+        contradiction_unscreened=tuple(
+            record.candidate_id
+            for record in ranked
+            if FLAG_CONTRADICTION_UNSCREENED in record.reasons
+        ),
         low_confidence=tuple(
             record.candidate_id for record in ranked if FLAG_LOW_CONFIDENCE in record.reasons
         ),
@@ -785,6 +857,7 @@ def decide(
         requests=len(replies),
         shards=len(prepared.shards),
         clipped_chars=prepared.clipped_chars,
+        source_clipped_chars=prepared.source_clipped_chars,
         latencies_ms=latencies,
     )
 
@@ -797,7 +870,12 @@ def _nothing_screened(
     *,
     requests: int = 0,
 ) -> RerankDecision:
-    """No order, and the retriever's own order handed back as explicitly unscreened."""
+    """No order, and the retriever's own order handed back as explicitly unscreened.
+
+    `requests` counts requests *attempted*, not requests that came back: a failed attempt was
+    sent, the SDK may have retried it, and it is billed for whatever it consumed. A caller
+    reading spend off the Decision must see it.
+    """
     return RerankDecision(
         reason=reason,
         mode=mode,
@@ -818,6 +896,14 @@ def rerank(
     model: str | None = None,
 ) -> RerankDecision:
     """Rerank one candidate set. Batched mode is one request; sharded and per-pair are more.
+
+    **This entry point sends its requests one at a time, and waits for each.** A batched set
+    is one round trip (or one per shard), but `mode=MODE_PER_PAIR` here is N *serial* round
+    trips, up to `MAX_REQUESTS` of them: nothing about a synchronous client can overlap them.
+    Per-pair mode is still worth running this way when the reason for it is accuracy — a long
+    passage that should not share 32k tokens with thirty others — but if the fan-out needs to
+    be concurrent, `rerank_async` runs the identical plan through `AsyncJev.map` with
+    `FAN_OUT_CONCURRENCY` in flight. The two produce the same decision from the same answers.
 
     Never raises for a condition that can happen at runtime: an oversized set comes back as
     `reason="refused"` and a transport failure as `reason="failed"`, both with an empty
@@ -845,7 +931,9 @@ def rerank(
                 mode,
                 items,
                 f"the request failed: {type(error).__name__}: {error}",
-                requests=len(replies),
+                # The replies that came back, plus the attempt that did not: it was sent and
+                # billed, so it counts here.
+                requests=len(replies) + 1,
             )
     return decide(replies, prepared, max_kept=max_kept)
 
@@ -861,11 +949,16 @@ async def rerank_async(
     concurrency: int = FAN_OUT_CONCURRENCY,
     model: str | None = None,
 ) -> RerankDecision:
-    """`rerank` over `AsyncJev.map`, which is what makes per-pair mode worth running.
+    """`rerank` over `AsyncJev.map`, with at most `concurrency` requests in flight.
+
+    This is the entry point that makes a per-pair fan-out concurrent; the synchronous
+    `rerank` sends the same plan serially. Both accept either mode.
 
     The fan-out is all-or-nothing by design: `AsyncJev.map` fails the call if any request
     fails, and a partial rerank would silently drop the candidates whose request did not
-    come back. That lands on `reason="failed"` with nothing screened.
+    come back. That lands on `reason="failed"` with nothing screened — and with `requests`
+    counting every request in the fan-out, because `map` dispatches them all and the ones
+    that succeeded were billed.
     """
     items = tuple(candidates)
     try:
@@ -878,7 +971,11 @@ async def rerank_async(
         replies = await jev.map(prepared.requests, concurrency=concurrency, model=model)
     except Exception as error:  # a partial fan-out is not a ranking
         return _nothing_screened(
-            "failed", mode, items, f"the fan-out failed: {type(error).__name__}: {error}"
+            "failed",
+            mode,
+            items,
+            f"the fan-out failed: {type(error).__name__}: {error}",
+            requests=len(prepared.shards),
         )
     return decide(replies, prepared, max_kept=max_kept)
 

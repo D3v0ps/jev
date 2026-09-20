@@ -32,7 +32,8 @@ two's single request. See docs/skill_selection.md.
 The two-stage shape (cheap wide pass, expensive narrow pass) is the standard
 retrieve-then-rerank arrangement applied to an activation decision. What this recipe adds
 is the `__none__` reference option, the within-request nomination rule, the power-scaled
-confidence gate, and the injection checks on both the turn and the candidate descriptions.
+confidence gate, the mechanical refusal to re-offer what the turn already holds, and the
+injection checks on both the turn and the candidate descriptions.
 """
 
 from __future__ import annotations
@@ -102,7 +103,10 @@ NOMINATE_INSTRUCTIONS: Mapping[str, Any] = {
     "none": f"Answer {NO_SKILL_OPTION} when nothing listed here is a fit. It is an ordinary answer.",
     "rules": [
         "Judge against `turn.request` and what satisfying it would actually require.",
-        "An entry named in `already_loaded` is loaded; do not choose it again.",
+        (
+            "`already_loaded` names what the agent is holding already, and those entries are "
+            "not offered here. Judge what this turn needs in addition to them."
+        ),
         (
             "This list may be one slice of a larger catalogue — `catalogue.shard` of "
             "`catalogue.shards`. Judge only the entries offered here."
@@ -198,9 +202,22 @@ DESCRIPTION_INJECTION_QUESTION = Noul(
 #: request's `__none__` mass — a comparison *within* one request, which is the only kind
 #: the normalisation supports.
 NOMINEE_OVER_NONE = 0.5
+#: But a shard has to have expressed a preference at all before any of its entries is
+#: eligible. `__none__` mass shrinks with the option count, so on a wide, uniform shard
+#: (254 entries, everything at 1/255) *every* entry clears `NOMINEE_OVER_NONE` times a
+#: vanishing reference and the shortlist ends up decided by the tie-break rather than by
+#: relevance. Confidence is the statistic that says a distribution is peaked at all, so
+#: it gates the shard: below this, the shard nominates nothing.
+NOMINATE_CONFIDENCE_MIN = 0.25
 #: Round two confirms strictly: a skill is only loaded when the full-text round makes it
 #: at least as likely as loading nothing.
 SELECT_OVER_NONE = 1.0
+#: `confidence` is one statistic about the *whole* `pick` ranking, not a per-candidate
+#: one: a peaked ranking is peaked on its winner, and reusing that number for a
+#: runner-up would make the gate looser the more the ranking favoured someone else. So a
+#: candidate after the top-ranked one also has to be a genuine co-winner — at least this
+#: fraction of the top candidate's mass — before it is loaded alongside it.
+RUNNER_UP_OVER_WINNER = 0.5
 
 #: Below this, the turn needs no capability at all and round two is never sent. The cheap
 #: path, and the common one.
@@ -234,11 +251,24 @@ CONFIDENCE_FLOOR: Mapping[str, float] = {
 POWERS_THAT_ESCALATE: frozenset[str] = frozenset({PRIVILEGED})
 
 #: Powers that are never auto-loaded on a description the request had to truncate. We
-#: only hand a loaded tool to a turn on text the model saw in full.
+#: only hand a loaded tool to a turn on text the model saw in full. It is the
+#: *description* that matters here: round two judges the fit on that text, and a capped
+#: summary only affected which entries got nominated, so `Plan.descriptions_trimmed` is
+#: the set this gate reads — not `Plan.trimmed`, which also names a capped summary or a
+#: capped name.
 POWERS_NEEDING_FULL_TEXT: frozenset[str] = frozenset({PRIVILEGED})
 
 #: Default cap on how many skills one turn may activate. The caller may lower it.
 SELECTION_LIMIT = 2
+
+#: Powers that activate alone: a skill at one of these is never loaded alongside another,
+#: whatever the ranking says. This used to be argued rather than enforced - the claim was
+#: that two PRIVILEGED skills could not both clear `CONFIDENCE_FLOOR` plus
+#: `RUNNER_UP_OVER_WINNER`, which only holds if `confidence` equals the winner's own
+#: probability mass. It does not: the API derives confidence from the shape of the whole
+#: distribution, so {0.50, 0.45, 0.05} at confidence 0.80 loads both. A safety property
+#: worth stating is worth a rule.
+POWERS_LOADED_ALONE: frozenset[str] = frozenset({PRIVILEGED})
 
 #: One Choice takes at most 255 options and one slot is reserved for `__none__`, so a
 #: catalogue larger than this is sharded into a tournament.
@@ -252,8 +282,13 @@ SHORTLIST_MAX = 8
 #: entries is reported unjudged rather than quietly unreachable.
 MAX_SHARDS = 8
 
-#: Text caps. A summary is a line; a description is an activation blurb, not a manual.
-#: Every entry these touch is named in `Decision.trimmed`.
+#: Text caps. A summary is a line; a description is an activation blurb, not a manual;
+#: a name is an identifier the caller's registry wrote. Every entry these touch is named
+#: in `Decision.trimmed`. The name is capped for the same reason as the other two: it is
+#: sent in every round-one option, so one absurd registry entry would otherwise push its
+#: whole shard past the request budget and make every skill in the catalogue
+#: unselectable.
+NAME_CHARS = 80
 SUMMARY_CHARS = 120
 DESCRIPTION_CHARS = 2000
 #: The turn itself. Context items are the agent's own reading and the likeliest place for
@@ -306,7 +341,10 @@ def build_final_questions(shortlist: Sequence[str]) -> dict[str, Any]:
     the *state* rather than in `criteria` precisely so that a Noul can be pointed at them:
     a catalogue entry is attacker-reachable text in any marketplace.
     """
-    options: dict[str, Any] = {key: {"see": f"candidates.{key}"} for key in shortlist}
+    # The backticks are the documented way to point a question at part of a structured
+    # state (docs/api-notes.md), and the `fits_<id>` Nouls below use the same form. Both
+    # signals have to be reading the same material for their agreement to mean anything.
+    options: dict[str, Any] = {key: {"see": f"`candidates.{key}`"} for key in shortlist}
     options[NO_SKILL_OPTION] = NO_SKILL_DESCRIPTION
     limits.check_choice(options, name=PICK_QUESTION_ID)
     questions: dict[str, Any] = {
@@ -347,6 +385,25 @@ def option_key(index: int) -> str:
     return f"{OPTION_PREFIX}{index}"
 
 
+def option_position(key: str) -> int:
+    """The catalogue position an option id stands for, for ordering.
+
+    Ties in a ranking break on this rather than on the id as a string: `s10` sorts before
+    `s2` lexicographically, which would make a systematic preference for low-numbered
+    *digits* look like the caller's catalogue order. Equal probabilities keep the
+    caller's own order instead.
+    """
+    return int(key[len(OPTION_PREFIX) :])
+
+
+def _by_rank(probabilities: Mapping[str, float]) -> list[tuple[str, float]]:
+    """Every option but `__none__`, most probable first, ties in catalogue order."""
+    return sorted(
+        ((key, mass) for key, mass in probabilities.items() if key != NO_SKILL_OPTION),
+        key=lambda kv: (-kv[1], option_position(kv[0])),
+    )
+
+
 def fits_question_id(key: str) -> str:
     """The question id of the per-candidate fit test for option `key`."""
     return f"{FITS_QUESTION_PREFIX}{key}"
@@ -374,8 +431,9 @@ class Turn:
     """What the agent is about to answer.
 
     `request` is the operator's. `context` is whatever the agent read to get here and is
-    untrusted. `loaded` names the skills already active, so a turn does not re-activate
-    what it is already holding.
+    untrusted. `loaded` names the skills already active by `Skill.name`: `build_plan`
+    leaves those entries out of the request altogether and reports them in
+    `Decision.already_loaded`, so a turn cannot re-activate what it is already holding.
     """
 
     request: str
@@ -397,15 +455,21 @@ class Plan:
     """The requests one decision would send, and everything left out of them.
 
     `unjudged` is the entries past `MAX_SHARDS` shards: never offered, therefore never
-    selectable, therefore reported. `trimmed` is the entries whose summary or description
-    was capped. `clipped` names the parts of the turn that were capped.
+    selectable, therefore reported. `already_loaded` is the entries the turn is already
+    holding: also never offered, also reported. `trimmed` is the entries whose name,
+    summary or description was capped, and `descriptions_trimmed` is the subset whose
+    *description* was — the only one the full-text gate may read. `clipped` names the
+    parts of the turn that were capped.
     """
 
     skills: tuple[Skill, ...]
     turn: Mapping[str, Any]
     shards: tuple[Shard, ...]
     unjudged: tuple[str, ...] = ()
+    already_loaded: tuple[str, ...] = ()
+    loaded: tuple[str, ...] = ()
     trimmed: tuple[str, ...] = ()
+    descriptions_trimmed: tuple[str, ...] = ()
     clipped: tuple[str, ...] = ()
     views: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
@@ -492,9 +556,11 @@ class Decision:
     `runners_up` carries every shortlisted candidate that was not selected with its
     round-two probability and the reason it lost, and `shards` carries the tournament: who
     was offered where, what each shard nominated, and how much mass each shard put on
-    `__none__`. `dropped`, `unjudged`, `trimmed` and `clipped` travel with every decision:
-    an entry that could not be offered must never be silently unselectable. `requests`
-    counts the replies this decision actually read, so a round that failed is zero.
+    `__none__`. `dropped`, `unjudged`, `already_loaded`, `trimmed` and `clipped` travel
+    with every decision: an entry that could not be offered must never be silently
+    unselectable. `requests` counts the replies this decision actually read, which on a
+    round that failed part-way is fewer than the requests the ledger was billed for; the
+    ledger is the record of spend, and `reason` says where the round stopped.
     """
 
     action: str
@@ -512,6 +578,7 @@ class Decision:
     none_mass: float | None = None
     dropped: tuple[str, ...] = ()
     unjudged: tuple[str, ...] = ()
+    already_loaded: tuple[str, ...] = ()
     trimmed: tuple[str, ...] = ()
     clipped: tuple[str, ...] = ()
 
@@ -542,7 +609,12 @@ def build_plan(turn: Turn, skills: Iterable[Skill]) -> Plan:
 
     Deterministic: shards keep the caller's own order, and the overflow past
     `MAX_SHARDS` shards is the tail of that order. Option ids are catalogue positions, so
-    a key means the same thing in round one and round two.
+    a key means the same thing in round one and round two — which is why an entry the turn
+    is already holding is left out of `shards` rather than renumbered away.
+
+    `turn.loaded` is enforced here rather than asked of the model: re-loading what the
+    agent is already holding is the prompt bloat this recipe exists to avoid, and a
+    guarantee a question carries is a guarantee only most of the time.
     """
     items = tuple(skills)
     for index, skill in enumerate(items):
@@ -553,23 +625,33 @@ def build_plan(turn: Turn, skills: Iterable[Skill]) -> Plan:
             )
 
     trimmed: list[str] = []
+    descriptions_trimmed: list[str] = []
     views: dict[str, Mapping[str, Any]] = {}
     summaries: dict[str, str] = {}
     for index, skill in enumerate(items):
         key = option_key(index)
+        name, name_cut = _trim(skill.name, NAME_CHARS)
         summary, summary_cut = _trim(skill.summary, SUMMARY_CHARS)
         description, description_cut = _trim(skill.description, DESCRIPTION_CHARS)
         summaries[key] = summary
-        view: dict[str, Any] = {"name": skill.name, "summary": summary}
+        view: dict[str, Any] = {"name": name, "summary": summary}
         if description:
             view["description"] = description
         if description_cut:
             view["clipped_chars"] = description_cut
+            descriptions_trimmed.append(key)
         views[key] = view
-        if summary_cut or description_cut:
+        if name_cut or summary_cut or description_cut:
             trimmed.append(key)
 
-    keys = [option_key(index) for index in range(len(items))]
+    loaded = tuple(turn.loaded)
+    held = set(loaded)
+    already_loaded = tuple(
+        option_key(index) for index, skill in enumerate(items) if skill.name in held
+    )
+    keys = [
+        option_key(index) for index, skill in enumerate(items) if skill.name not in held
+    ]
     runs = limits.shard(keys, SHARD_OPTIONS)
     offered = runs[:MAX_SHARDS]
     unjudged = tuple(key for run in runs[MAX_SHARDS:] for key in run)
@@ -606,7 +688,10 @@ def build_plan(turn: Turn, skills: Iterable[Skill]) -> Plan:
         turn=turn_view,
         shards=shards,
         unjudged=unjudged,
+        already_loaded=already_loaded,
+        loaded=loaded,
         trimmed=tuple(trimmed),
+        descriptions_trimmed=tuple(descriptions_trimmed),
         clipped=tuple(clipped),
         views=views,
     )
@@ -644,12 +729,14 @@ def build_final_state(plan: Plan, nomination: Nomination) -> dict[str, Any]:
 def nominate(replies: Sequence[Reply], plan: Plan) -> Nomination:
     """Merge round one into one shortlist. Pure: no I/O, no clock, no network.
 
-    Two things here are deliberate. Nominating uses only comparisons *inside* one reply —
+    Three things here are deliberate. Nominating uses only comparisons *inside* one reply —
     a candidate against that same request's `__none__` mass — because a Choice normalises
     its probabilities per request, so a number from one shard says nothing about a number
-    from another. Filling the shortlist is round-robin by rank for the same reason: shard
-    three's best and shard one's best both go in, and neither displaces the other on a
-    score they do not share.
+    from another. A shard whose own confidence is below `NOMINATE_CONFIDENCE_MIN`
+    nominates nothing at all, because on a flat wide shard the `__none__` reference is
+    vanishingly small and everything clears it. Filling the shortlist is round-robin by
+    rank for the same reason as the first: shard three's best and shard one's best both go
+    in, and neither displaces the other on a score they do not share.
 
     Fails closed: a rejected or missing answer stops the decision with `stop` set, which
     the caller turns into SELECT_NONE. Nothing is ever nominated on an answer that failed
@@ -676,19 +763,22 @@ def nominate(replies: Sequence[Reply], plan: Plan) -> Nomination:
             confidence = reply.confidence(NOMINATE_QUESTION_ID)
             none_mass = probabilities[NO_SKILL_OPTION]
         except (AnswerRejected, KeyError) as error:
+            # The shards that already answered cleanly are evidence the caller paid for,
+            # so they travel with the rejection rather than being dropped with it.
             return Nomination(
+                shards=tuple(results),
                 stop="rejected",
                 needs_skill=needs_skill,
                 turn_injection=turn_injection,
                 detail=f"shard {shard.number}: {error}",
             )
-        ranked = [
-            (key, mass)
-            for key, mass in sorted(probabilities.items(), key=lambda kv: (-kv[1], kv[0]))
-            if key != NO_SKILL_OPTION
-        ]
+        ranked = _by_rank(probabilities)
         floor = none_mass * NOMINEE_OVER_NONE
-        eligible = tuple(key for key, mass in ranked if mass >= floor)
+        eligible = (
+            tuple(key for key, mass in ranked if mass >= floor)
+            if confidence >= NOMINATE_CONFIDENCE_MIN
+            else ()
+        )
         results.append(
             ShardResult(
                 number=shard.number,
@@ -739,15 +829,24 @@ def nominate(replies: Sequence[Reply], plan: Plan) -> Nomination:
             ),
         )
     if not shortlist:
+        flat = tuple(
+            result.number for result in results if result.confidence < NOMINATE_CONFIDENCE_MIN
+        )
+        detail = (
+            "no entry beat its own shard's __none__ mass by "
+            f"{NOMINEE_OVER_NONE}; the full-text round was not sent"
+        )
+        if flat:
+            detail += (
+                f" (shards {list(flat)} expressed no preference at all: confidence below "
+                f"{NOMINATE_CONFIDENCE_MIN}, so none of their entries was eligible)"
+            )
         return Nomination(
             shards=shards,
             needs_skill=needs_skill,
             turn_injection=turn_injection,
             stop="no_candidate",
-            detail=(
-                "no entry beat its own shard's __none__ mass by "
-                f"{NOMINEE_OVER_NONE}; the full-text round was not sent"
-            ),
+            detail=detail,
         )
     return Nomination(
         shards=shards,
@@ -778,10 +877,21 @@ def _ended(
         turn_injection=nomination.turn_injection,
         dropped=nomination.dropped,
         unjudged=plan.unjudged,
+        already_loaded=plan.already_loaded,
         trimmed=plan.trimmed,
         clipped=plan.clipped,
         **evidence,
     )
+
+
+def nothing_to_judge(plan: Plan) -> str:
+    """Why a plan with no shards asked nothing. Pure."""
+    if plan.already_loaded:
+        return (
+            f"every entry this turn could use is already loaded "
+            f"({', '.join(plan.loaded)}), so no request was made"
+        )
+    return "the catalogue is empty, so no request was made"
 
 
 def select_nothing(plan: Plan, nomination: Nomination, *, requests: int) -> Decision:
@@ -808,9 +918,14 @@ def decide(
     put the candidate above `__none__`, and the candidate's own Noul has to clear the floor
     for its power. Either one alone loads nothing.
 
+    A candidate after the top-ranked one clears a third bar, `RUNNER_UP_OVER_WINNER`: the
+    ranking's `confidence` describes the whole distribution, so it is evidence about the
+    winner and says nothing about whoever came second.
+
     Fails closed. A rejected answer, an injected description, a ranking that lands on
-    `__none__`, a fit below the floor, or confidence below the floor all end in
-    SELECT_NONE — or, for a skill that can spend or destroy, in ASK_USER.
+    `__none__`, a fit below the floor, confidence below the floor, or a candidate the turn
+    is already holding all end in SELECT_NONE — or, for a skill that can spend or destroy,
+    in ASK_USER.
     """
     if limit < 1:
         raise ValueError(f"limit must be at least 1, got {limit}")
@@ -849,11 +964,7 @@ def decide(
             **evidence,
         )
 
-    ranked = [
-        (key, mass)
-        for key, mass in sorted(probabilities.items(), key=lambda kv: (-kv[1], kv[0]))
-        if key != NO_SKILL_OPTION
-    ]
+    ranked = _by_rank(probabilities)
 
     if picked == NO_SKILL_OPTION:
         # `ranked` is empty only if a caller hands `decide` an empty shortlist, which
@@ -882,19 +993,34 @@ def decide(
     selected: list[Selection] = []
     runners_up: list[Ranked] = []
     deferred: list[str] = []
-    truncated = set(plan.trimmed)
-    for key, mass in ranked:
+    # Only a truncated *description* blocks a privileged auto-load: that is the text round
+    # two judged. A capped summary or name is reported in `trimmed` but says nothing about
+    # whether the model read the description in full.
+    truncated = set(plan.descriptions_trimmed)
+    held = set(plan.loaded)
+    top_mass = ranked[0][1] if ranked else 0
+    for position, (key, mass) in enumerate(ranked):
         skill = plan.skill_for(key)
         fit = fits[key]
         fit_min = fits_floor(skill.power)
         confidence_min = confidence_floor(skill.power)
         note = ""
-        if len(selected) >= limit:
+        if skill.name in held:
+            # build_plan does not offer these at all; this is the backstop for a caller
+            # that assembles a Nomination itself.
+            note = "the turn is already holding it"
+        elif len(selected) >= limit:
             note = f"the turn's limit of {limit} was already filled"
         elif fit < fit_min:
             note = f"fit {fit:.2f} < {fit_min} for a {skill.power} skill"
         elif mass < none_mass * SELECT_OVER_NONE:
             note = f"probability {mass:.2f} did not beat __none__ at {none_mass:.2f}"
+        elif position and mass < top_mass * RUNNER_UP_OVER_WINNER:
+            note = (
+                f"probability {mass:.2f} is under {RUNNER_UP_OVER_WINNER} of the top "
+                f"candidate's {top_mass:.2f}, and the ranking's confidence is about that "
+                "candidate, not this one"
+            )
         elif confidence < confidence_min:
             note = f"ranking confidence {confidence:.2f} < {confidence_min} for a {skill.power} skill"
             if skill.power in POWERS_THAT_ESCALATE:
@@ -903,6 +1029,14 @@ def decide(
             note = f"a {skill.power} skill is not auto-loaded on a description we truncated"
             if skill.power in POWERS_THAT_ESCALATE:
                 deferred.append(key)
+        # Last, so a skill that also failed a floor is recorded against the floor - the more
+        # informative note - and only a skill that would otherwise have loaded is turned away
+        # for this. Nothing is deferred to the person here: something else did load.
+        elif selected and skill.power in POWERS_LOADED_ALONE:
+            note = f"a {skill.power} skill activates on its own, not alongside another"
+        elif selected and any(chosen.skill.power in POWERS_LOADED_ALONE for chosen in selected):
+            alone = next(c for c in selected if c.skill.power in POWERS_LOADED_ALONE)
+            note = f"{alone.skill.name} is {alone.skill.power} and activates on its own"
         if note:
             runners_up.append(Ranked(key=key, name=skill.name, probability=mass, fits=fit, note=note))
             continue
@@ -957,6 +1091,7 @@ def decide(
         turn_injection=nomination.turn_injection,
         dropped=nomination.dropped,
         unjudged=plan.unjudged,
+        already_loaded=plan.already_loaded,
         trimmed=plan.trimmed,
         clipped=plan.clipped,
         **evidence,
@@ -983,20 +1118,25 @@ def select_skills(
     if not plan.shards:
         return _ended(
             SELECT_NONE,
-            "the catalogue is empty, so no request was made",
+            nothing_to_judge(plan),
             plan,
             Nomination(stop="empty_catalogue"),
             requests=0,
         )
+    replies: list[Reply] = []
     try:
-        replies = [jev.ask(state, questions, model=model) for state, questions in plan.requests]
+        # A loop, not a comprehension: when shard five of eight fails, the four requests
+        # already sent are in the caller's ledger, and `requests` has to agree with it.
+        for state, questions in plan.requests:
+            replies.append(jev.ask(state, questions, model=model))
     except Exception as error:  # a failed request must not become an activation
         return _ended(
             SELECT_NONE,
-            f"round one failed: {type(error).__name__}: {error}",
+            f"round one failed after {len(replies)} of {len(plan.shards)} shards: "
+            f"{type(error).__name__}: {error}",
             plan,
             Nomination(stop="failed"),
-            requests=0,
+            requests=len(replies),
         )
     nomination = nominate(replies, plan)
     if nomination.stop is not None:
@@ -1042,7 +1182,7 @@ async def select_skills_async(
     if not plan.shards:
         return _ended(
             SELECT_NONE,
-            "the catalogue is empty, so no request was made",
+            nothing_to_judge(plan),
             plan,
             Nomination(stop="empty_catalogue"),
             requests=0,
@@ -1050,9 +1190,14 @@ async def select_skills_async(
     try:
         replies = await jev.map(plan.requests, concurrency=concurrency, model=model)
     except Exception as error:  # a failed request must not become an activation
+        # `map` is all-or-nothing, so how many of the shards were sent before the failure
+        # is not knowable here — unlike the synchronous path, which counts them. The
+        # caller's ledger is the record of what was billed; `requests` counts replies read.
         return _ended(
             SELECT_NONE,
-            f"round one failed: {type(error).__name__}: {error}",
+            f"round one failed, and no reply was read; how many of the "
+            f"{len(plan.shards)} shards were billed is in jev.ledger: "
+            f"{type(error).__name__}: {error}",
             plan,
             Nomination(stop="failed"),
             requests=0,

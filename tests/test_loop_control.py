@@ -8,6 +8,7 @@ property under test is that a DONE never comes from the model alone.
 from __future__ import annotations
 
 import math
+from difflib import SequenceMatcher
 
 import pytest
 
@@ -25,6 +26,7 @@ from jevkit.recipes.loop_control import (
     DONE_CONFIDENCE,
     GOAL_MET,
     GOAL_MET_DONE,
+    NEAR_IDENTICAL_RATIO,
     NEEDS_HUMAN,
     PROGRESS,
     PROGRESS_FLOOR,
@@ -163,11 +165,24 @@ def test_the_state_carries_the_loop_and_the_counters_are_the_callers(jev):
     assert state["observed"] == check_in.observed
 
 
-def test_the_action_is_always_one_of_the_five_verdict_keys(jev):
-    for pick in VERDICT_OPTIONS:
-        decision, _ = one(jev, plan_for(pick, goal_met=0.99), verify=lambda: True)
-        assert decision.action in VERDICT_OPTIONS
-        assert decision.verdict == pick, "the model's own verdict is logged even when code overrides it"
+#: What each verdict maps to on a healthy check-in: nothing in `plan_for`'s defaults trips a
+#: gate, so the action follows the model and the reason names the branch that produced it.
+VERDICT_MAPPING = {
+    CONTINUE: (CONTINUE, "progressing"),
+    DONE: (DONE, "goal_verified"),
+    STUCK: (STUCK, "stuck"),
+    BLOCKED: (BLOCKED, "blocked"),
+    NEEDS_HUMAN: (NEEDS_HUMAN, "asked"),
+}
+
+
+@pytest.mark.parametrize("pick", VERDICT_OPTIONS)
+def test_each_verdict_maps_to_the_action_and_reason_it_should(jev, pick):
+    """Not `action in VERDICT_OPTIONS` — that holds for any mapping, including a wrong one."""
+    decision, _ = one(jev, plan_for(pick, goal_met=0.99), verify=lambda: True)
+
+    assert (decision.action, decision.reason) == VERDICT_MAPPING[pick]
+    assert decision.verdict == pick
 
 
 # --- DONE is not proof: the core contract ---------------------------------
@@ -317,6 +332,64 @@ def test_an_unverified_done_on_the_last_allowed_step_still_stops_for_a_person(je
     assert decision.reason == "unverified_done"
 
 
+@pytest.mark.parametrize(
+    "step,elapsed,reason",
+    [(STEPS * 6, 1.0, "budget_exhausted"), (2, 9999.0, "budget_exhausted")],
+)
+def test_an_unverified_done_cannot_end_a_run_that_is_past_a_code_ceiling(jev, step, elapsed, reason):
+    """`allow_unverified_done` buys a labelled DONE, not an exemption from the counters."""
+    check_in = make_check_in(step=step, budget=Budget(max_steps=STEPS, max_wall_s=10.0), elapsed_s=elapsed)
+    decision, _ = one(
+        jev,
+        plan_for(DONE, goal_met=0.99, confidence=0.97),
+        check_in,
+        allow_unverified_done=True,
+    )
+
+    assert (decision.action, decision.reason) == (NEEDS_HUMAN, reason)
+    assert decision.unverified_done is False, "an overrun must not be logged as a finished run"
+    assert decision.verdict == DONE, "the model's own verdict is logged even when code overrides it"
+    assert "budget is a code verdict" in decision.detail
+
+
+def test_an_unverified_done_cannot_end_a_run_that_has_repeated_itself_past_escalation(jev):
+    history = ["open /orders", *["retry POST /orders"] * (REPEAT_ESCALATE_AT + 1)]
+    check_in = make_check_in(history=history, step=len(history), budget=Budget(max_steps=STEPS * 4))
+    decision, _ = one(
+        jev,
+        plan_for(DONE, goal_met=0.99, confidence=0.97),
+        check_in,
+        allow_unverified_done=True,
+    )
+
+    assert (decision.action, decision.reason) == (NEEDS_HUMAN, "repeating")
+    assert decision.repeats == REPEAT_ESCALATE_AT
+    assert decision.unverified_done is False
+
+
+@pytest.mark.parametrize(
+    "step,elapsed,history",
+    [
+        (STEPS * 6, 1.0, ["read ticket 4412"]),
+        (2, 9999.0, ["read ticket 4412"]),
+        (2, 1.0, ["open /orders", *["retry POST /orders"] * (REPEAT_ESCALATE_AT + 1)]),
+    ],
+)
+def test_a_verified_done_still_wins_over_every_code_ceiling(jev, step, elapsed, history):
+    """The counters override a claim, not a confirmation: `verify` looked at the world."""
+    check_in = make_check_in(
+        step=step,
+        elapsed_s=elapsed,
+        history=history,
+        budget=Budget(max_steps=STEPS, max_wall_s=10.0),
+    )
+    checker = Checker(True)
+    decision, _ = one(jev, plan_for(DONE, goal_met=0.99, confidence=0.97), check_in, verify=checker)
+
+    assert (decision.action, decision.reason) == (DONE, "goal_verified")
+    assert decision.verified is True and checker.calls == 1
+
+
 # --- stuck, blocked, and the difference -----------------------------------
 
 
@@ -365,6 +438,17 @@ def test_the_models_read_of_repetition_counts_toward_a_stall(jev, repeating, act
 
     assert decision.action == action
     assert decision.repeating == pytest.approx(repeating)
+    assert f"repeating {repeating:.2f}" in decision.line(), "a stall input has to be in the log line"
+
+
+def test_the_log_line_carries_every_noul_the_stall_test_reads(jev):
+    """A CONTINUE explains itself too: all three stall inputs, not only the ones that fired."""
+    decision, _ = one(jev, plan_for(CONTINUE, progress=0.88, repeating=0.31, steering=0.04))
+    line = decision.line()
+
+    assert "progress 0.88" in line
+    assert "repeating 0.31" in line
+    assert "steering 0.04" in line
 
 
 # --- what code counts, not what the model judges --------------------------
@@ -381,6 +465,61 @@ def test_repeats_in_counts_identical_and_near_identical_steps():
     assert repeats_in(["open the settings page", "delete the old invoices"]) == 0
     with pytest.raises(ValueError, match="window"):
         repeats_in(["a", "a"], window=0)
+
+
+#: A record short enough that `ENTRY_CHARS` does not cut it, so only the ratio is in play.
+SIMILAR_BASE = "post /v1/orders " + "x" * 400
+
+
+def with_tail(extra: int) -> str:
+    """`SIMILAR_BASE` plus `extra` characters it does not share: longer tail, lower ratio."""
+    return SIMILAR_BASE + "y" * extra
+
+
+def shortest_tail_under_the_ratio() -> int:
+    """The shortest tail that drops the similarity below NEAR_IDENTICAL_RATIO.
+
+    Derived from the constant the way WARN_STEP is, so this test keeps straddling the
+    threshold if it moves instead of pinning two hand-picked strings either side of it.
+    """
+    extra = 1
+    while SequenceMatcher(None, SIMILAR_BASE, with_tail(extra)).ratio() >= NEAR_IDENTICAL_RATIO:
+        extra += 1
+    return extra
+
+
+def test_near_identical_is_decided_at_the_ratio_in_the_review_block():
+    boundary = shortest_tail_under_the_ratio()
+    above, below = with_tail(boundary - 1), with_tail(boundary)
+
+    assert SequenceMatcher(None, SIMILAR_BASE, above).ratio() >= NEAR_IDENTICAL_RATIO
+    assert SequenceMatcher(None, SIMILAR_BASE, below).ratio() < NEAR_IDENTICAL_RATIO
+    assert len(below) <= lc.ENTRY_CHARS, "the pair must straddle the ratio, not the character cap"
+    assert repeats_in([SIMILAR_BASE, above]) == 1, "at or above the ratio is the same action"
+    assert repeats_in([SIMILAR_BASE, below]) == 0, "just under it is a different action"
+
+
+def test_the_repeat_detector_compares_what_the_request_sends(jev):
+    """`ENTRY_CHARS` caps the comparison too, so it agrees with the state the model sees.
+
+    The two records are identical for the whole prefix that is sent and differ only in the
+    bulk that is cut, so an uncapped comparison calls them different actions while the model
+    is handed two identical steps.
+    """
+    shared = "retry POST /v1/orders " + "z" * lc.ENTRY_CHARS
+    pair = [shared + "a" * 2_000, shared + "b" * 2_000]
+    assert SequenceMatcher(None, *pair).ratio() < NEAR_IDENTICAL_RATIO, "uncapped, these differ"
+
+    decision, calls = one(
+        jev,
+        plan_for(CONTINUE, progress=0.95, repeating=0.02),
+        make_check_in(history=pair, step=2),
+    )
+
+    sent = calls[0].state["history"]
+    assert sent[0] == sent[1], "the request carries two identical steps"
+    assert sent[0].endswith(lc.CUT_MARK), "both were cut to the same cap"
+    assert decision.repeats == 1, "the counter has to agree with the state it is sent alongside"
 
 
 def test_the_repeat_window_forgets_older_work():
@@ -533,6 +672,25 @@ def test_a_rejected_answer_asks_a_person_and_contributes_no_evidence(jev):
     assert "not offered" in decision.detail
 
 
+@pytest.mark.parametrize("record", ["mixed_keys", "cycle"])
+def test_a_history_record_that_cannot_be_serialised_asks_a_person(jev, record):
+    """The repeat counter runs on raw caller records, so it fails closed like everything else."""
+    if record == "mixed_keys":
+        broken: object = {"step": 1, 1: "a tuple key a real log can hold"}
+    else:
+        broken = {"action": "retry"}
+        broken["self"] = broken  # type: ignore[index]
+    check_in = make_check_in(history=["open /orders", broken], step=2)
+
+    decision, calls = one(jev, plan_for(), check_in)
+
+    assert decision.action == NEEDS_HUMAN, "an unserialisable step must not kill the agent loop"
+    assert decision.reason == "failed"
+    assert decision.detail
+    assert decision.repeats == 0, "the counter never ran, so it reports nothing"
+    assert calls == [], "the request was never built"
+
+
 def test_a_transport_failure_asks_a_person_instead_of_raising(jev):
     decision, calls = one(jev, [Fail(422, "malformed request")])
 
@@ -668,6 +826,62 @@ def test_measure_counts_an_unverified_done_as_unverified(jev):
     assert watch.unverified_dones == 1
 
 
+def test_the_reported_latency_covers_the_local_work_not_only_the_request(jev):
+    """`repeats_in` and `prepare` run on the caller's records; their cost is the loop's too."""
+    client, calls = jev(plan_for())
+    history = [f"call tool {index} " + "q" * 5_000 for index in range(REPEAT_WINDOW + 2)]
+    decision = check_step(client, make_check_in(history=history, step=len(history)))
+
+    assert len(calls) == 1
+    request_only = client.ledger.latencies_ms[-1]
+    assert decision.latency_ms > request_only, (
+        "the reported latency must include the local work, not just the request"
+    )
+
+
+def test_the_watch_takes_one_latency_per_check_from_the_decisions(jev):
+    client, _ = jev(plan_for(CONTINUE))
+    watch = measure(client, [make_check_in(step=index + 1) for index in range(3)], stop_early=False)
+
+    assert len(watch.latencies_ms) == watch.checks == 3
+    assert watch.latencies_ms == tuple(decision.latency_ms for decision in watch.decisions)
+
+
+def test_a_check_that_never_reached_the_network_still_counts_against_the_budget(jev):
+    """A locally refused request costs the loop time; a ledger slice would have shown none."""
+    huge = "x" * (limits.CONTEXT_TOKENS * limits.CHARS_PER_TOKEN + 1)
+    client, calls = jev(plan_for())
+    watch = measure(client, [make_check_in(goal=huge)])
+
+    assert calls == [] and watch.calls == 0
+    assert watch.checks == 1
+    assert len(watch.latencies_ms) == 1, "the check happened, so the instrument has a sample"
+    assert watch.p95_ms is not None, "the loop waited for it, so the wait is measured"
+    assert watch.within_budget() is False, (
+        "the sample is real, the measurement is not: no Jev round trip completed, so the "
+        "sub-second hypothesis is unanswered rather than met"
+    )
+    assert "unanswered" in watch.summary()
+    assert watch.usd is None or watch.usd == 0
+
+
+def test_a_run_where_every_request_failed_cannot_report_the_budget_as_met(jev):
+    """The headline hypothesis must not be answerable by failures alone.
+
+    A run of 401s has a latency sample per check - the loop really did wait - but nothing
+    measured a Jev round trip, and printing 'sub-second holds' off that is exactly the
+    "measure, do not assert" failure this repo is built to avoid.
+    """
+    client, _ = jev([Fail(401, "bad key")] * 3)
+    watch = measure(client, [make_check_in(step=index + 1) for index in range(3)], stop_early=False)
+
+    assert [decision.reason for decision in watch.decisions] == ["failed"] * 3
+    assert watch.calls == 0
+    assert len(watch.latencies_ms) == 3
+    assert watch.within_budget() is False
+    assert "unanswered" in watch.summary()
+
+
 @pytest.mark.parametrize(
     "latencies,within",
     [
@@ -720,6 +934,27 @@ async def test_the_async_check_fails_closed_too(async_jev):
 
     assert decision.action == NEEDS_HUMAN
     assert decision.reason == "failed"
+
+
+async def test_the_async_check_survives_an_unserialisable_history_record(async_jev):
+    """The same fail-closed path as the sync entry point, exercised through the async one.
+
+    `repeats_in` runs on raw caller records before the request is built, so a record a real
+    agent log can hold - a self-referential dict, a tuple key - must reach NEEDS_HUMAN
+    rather than raise out of a loop whose whole job is to decide whether to keep going.
+    """
+    cyclic: dict = {"action": "retry"}
+    cyclic["self"] = cyclic
+    client, calls = async_jev(plan_for())
+    try:
+        decision = await check_step_async(client, make_check_in(history=["open /orders", cyclic], step=2))
+    finally:
+        await client.aclose()
+
+    assert decision.action == NEEDS_HUMAN, "an unserialisable step must not kill the agent loop"
+    assert decision.reason == "failed"
+    assert decision.repeats == 0, "the counter never ran, so it reports nothing"
+    assert calls == [], "nothing was sent"
 
 
 def test_a_first_step_with_no_history_is_still_a_valid_check(jev):

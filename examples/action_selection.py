@@ -85,7 +85,11 @@ def estimated_tokens_per_decision(screen: tuple[Candidate, ...]) -> int:
 
 
 def number(value: float | None) -> str:
-    """Evidence is absent on the paths that never got an answer; say so instead of lying."""
+    """Evidence is absent on the paths that never got an answer; say so instead of lying.
+
+    `margin` is also None on a head that offered a single candidate: there was no
+    runner-up, so there is no lead to print.
+    """
     return "n/a" if value is None else f"{value:.2f}"
 
 
@@ -103,7 +107,10 @@ def main() -> None:
                 print(f"  handle        {decision.target.handle!r}  (never sent to the model)")
             if decision.action == ASK_OPERATOR:
                 print("  a human decides this step; nothing was clicked")
-            print(f"  stakes        {number(decision.stakes)} -> floor {number(decision.floor)}")
+            print(
+                f"  stakes        mean {number(decision.stakes)}, gating "
+                f"{number(decision.stakes_gate)} -> floor {number(decision.floor)}"
+            )
             print(f"  confidence    {number(decision.confidence)} (margin {number(decision.margin)})")
             print(f"  injection     {number(decision.injection)}")
             print(f"  goal evidence {number(decision.goal_evidence)}")

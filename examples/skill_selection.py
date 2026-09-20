@@ -141,6 +141,8 @@ TURNS = (
         ),
     ),
     (
+        # `incident-review` is in this catalogue and already loaded, so it is left out of
+        # round one entirely and reported in `Decision.already_loaded`.
         "a turn that asks for a release",
         Turn(
             request="Ship 4.11.2 to production now, the hotfix is approved.",
@@ -211,8 +213,10 @@ def main() -> None:
                       f"(__none__ {shard.none_mass:.2f}, confidence {shard.confidence:.2f})")
             for item in decision.runners_up:
                 print(f"    runner-up {item.name} p={item.probability:.2f}: {item.note}")
-            if decision.dropped or decision.unjudged or decision.trimmed or decision.clipped:
+            if (decision.dropped or decision.unjudged or decision.already_loaded
+                    or decision.trimmed or decision.clipped):
                 print(f"  not offered   dropped={decision.dropped} unjudged={len(decision.unjudged)} "
+                      f"already_loaded={decision.already_loaded} "
                       f"trimmed={decision.trimmed} clipped={decision.clipped}")
 
         print(f"\nledger: {jev.ledger.summary()}")

@@ -100,14 +100,38 @@ The model judges progress. It never decides whether the run is out of budget:
   capped at 1, so an overrun is visible in the log rather than rounded away.
 - **`repeats_in(history)`** counts, deterministically, how many of the last `REPEAT_WINDOW`
   steps repeat the latest one. It normalises case and whitespace, serialises non-strings,
-  and treats two records as the same action when they are `NEAR_IDENTICAL_RATIO` similar —
-  which catches `attempt 3` / `attempt 4` and `page=1` / `page=2`. It counts matches
-  anywhere in the window, not only consecutive ones, so an a-b-a-b cycle is caught too.
+  and treats two records as the same action when they are `NEAR_IDENTICAL_RATIO` similar.
+  That is a ratio over the whole record, so the same one-token edit passes or fails on
+  length: `difflib.SequenceMatcher` puts `GET /orders?page=1 retry` against `page=2` at
+  0.958 and catches it, but bare `page=1` against `page=2` at 0.833 and does not. Short
+  records are compared for equality in practice. It counts matches
+  anywhere in the window, not only consecutive ones, so an a-b-a-b cycle is caught too. It
+  compares each record's first `ENTRY_CHARS` characters, the same cap `prepare` sends, so
+  the counter agrees with the steps the model is shown and its own cost stays bounded by a
+  number in the review block rather than by how much a caller logs per step.
+
+Exactly one thing outranks those counters: a DONE the caller's own `verify()` returned True
+for. Finishing on the last allowed step is finishing, and the confirmation came from code
+looking at the world. An **unverified** DONE does not outrank them — not even with
+`allow_unverified_done=True`, which buys a labelled DONE and not an exemption. Past the step
+or wall ceiling, or at `REPEAT_ESCALATE_AT` repeats, it falls through to
+`needs_human` / `budget_exhausted` or `needs_human` / `repeating`, with the done claim still
+in the decision's evidence and `decision.verdict` still reading `done`. Without that, the
+one permissive outcome in the recipe would have been reachable from a model answer alone at
+any distance past a ceiling.
 
 ## Thresholds
 
 Every one of these lives in the review block at the top of the module, and
-`tests/test_loop_control.py` exercises both sides of each.
+`tests/test_loop_control.py` exercises both sides of each — including
+`NEAR_IDENTICAL_RATIO`, whose pair is built by searching for the shortest suffix that drops
+`difflib`'s ratio under the constant, so the two records straddle it wherever it is set.
+
+What those tests pin is the *comparison*, not the value: they derive their inputs from the
+constants, so lowering `GOAL_MET_DONE` or `DONE_CONFIDENCE` keeps the suite green. That is
+deliberate — the value is the judgment this review block exists to put in front of a human,
+and the tests are there to prove the code reads it and that both sides of it behave. Changing
+one is a review, not a test failure.
 
 | threshold | value | what it gates |
 | --- | --- | --- |
@@ -124,7 +148,7 @@ Every one of these lives in the review block at the top of the module, and
 | `REPEAT_WINDOW` | 6 | How many recent steps the counter looks at. |
 | `NEAR_IDENTICAL_RATIO` | 0.90 | Similarity at which two actions are the same action. Lower starts merging genuine alternatives. |
 | `HISTORY_WINDOW` | 8 | Recent steps sent as state. Older ones are reported in `dropped_steps`. |
-| `ENTRY_CHARS` | 600 | Character cap per step and on `observed`. Cuts are named in `truncated`. |
+| `ENTRY_CHARS` | 600 | Character cap per step and on `observed`, and the prefix `repeats_in` compares. Cuts are named in `truncated`. |
 | `CHECK_BUDGET_MS` | 1000.0 | **Not a measurement.** The hypothesis `Watch.within_budget()` tests against your account. |
 
 ## The order of the gates is the policy
@@ -137,7 +161,8 @@ Every one of these lives in the review block at the top of the module, and
    about stopping poisons every other answer in the reply — including a done claim that
    would otherwise have been verified.
 3. **The done branch**, before the budget, so a run that finishes on its last allowed step
-   is DONE rather than an escalation.
+   is DONE rather than an escalation — but only when `verify()` confirmed it. An unverified
+   DONE falls through to 4 and 5 instead of ending the run.
 4. **Budget exhausted** → `needs_human` / `budget_exhausted`. A code verdict.
 5. **`REPEAT_ESCALATE_AT` repeats** → `needs_human` / `repeating`. Also a code verdict.
 6. **The model asked for a person** → `needs_human` / `asked`. No confidence gate: asking
@@ -164,9 +189,27 @@ context: an oversized one is refused locally by `jevkit.limits` and becomes
 
 ## Cost arithmetic
 
-From `jevkit.limits.estimate_tokens` over this module's own questions (run
-`build_questions()` and measure it yourself; the estimator is deliberately conservative at
-4 characters per token):
+Every number below is `jevkit.limits.estimate_tokens` over the request this module's own
+`build_questions()` and `build_state()` produce, priced through `jevkit.cost`. It is an
+estimate, not a tokenizer: `estimate_tokens` divides the encoded JSON by
+`limits.CHARS_PER_TOKEN` (4), which deliberately overcounts so a request that would have
+fit is never refused locally. Reproduce all of it with:
+
+```python
+from jevkit import cost, limits
+from jevkit.recipes.loop_control import prepare
+import examples.loop_control as ex
+
+run = ex.Run()
+for index in range(3):
+    check_in = run.take(index)   # the example's step 3: goal, plan, 3 steps, the injected page
+request = prepare(check_in)
+
+{qid: limits.estimate_tokens(q) for qid, q in request.questions.items()}
+limits.estimate_tokens(request.questions)   # 1118 — the whole questions map, as encoded
+limits.estimate_tokens(request.state)       #  229 — this check-in's state
+cost.usd_for("jev-latest", 1118 + 229)      #  5.6574e-05
+```
 
 | part of the request | estimated tokens |
 | --- | --- |
@@ -176,27 +219,30 @@ From `jevkit.limits.estimate_tokens` over this module's own questions (run
 | `repeating` | 92 |
 | `steering` | 150 |
 | `remaining` (4 levels) | 148 |
-| six questions | 1,111 |
-| state, for the example's check-in (goal, plan, 3 steps, one tool result) | 93 |
-| **one check** | **~1,204** |
+| the six questions summed one by one | 1,111 |
+| the questions map as one encoded object | 1,118 |
+| state, for the example's step-3 check-in | 229 |
+| **one check** (questions map + that state) | **1,347** |
 
-At the published price in `jevkit.cost` — $0.042 per million input tokens, output tokens
-free — that is:
+The questions are constant, so that 1,347 is the only part of this table a different
+check-in changes. Across the example's eight scripted steps the state runs 104 → 305
+tokens, i.e. 1,222 → 1,423 per check — the estimate grows with how much history you send,
+not with how long the run is. At the published price in `jevkit.cost` — $0.042 per million
+input tokens, output tokens free:
 
 ```
-1,204 tokens × $42/1e9 = $0.0000506 per check
-                        ≈ $0.051 per 1,000 checks
-                        ≈ 19,800 checks per dollar
+1,347 × $42/1e9 = $0.000056574 per check
+                ≈ $0.0566 per 1,000 checks
+                ≈ 17,676 checks per dollar
 ```
 
-The questions dominate: the state for a normal check-in is under a tenth of the request,
-so cost per check is close to constant and scales with how much history you send, not with
-how long the run is. The billed number is the `input_tokens` the API reports, which
-`Watch` and `jev.ledger` accumulate for a real run — the table above is a local estimate
-of the same thing, and the two will not match to the token.
+The billed number is the `input_tokens` the API reports, which `Watch` and `jev.ledger`
+accumulate for a real run. There is no API key in this repo's environment, so no figure
+here is a billed one; run the example on your own account for that, and expect the estimate
+and the bill to differ, in that direction.
 
-The request fits with room to spare: the longest question is 417 tokens, leaving about
-31,600 of the 32k state-plus-longest-question budget for history.
+The request fits with room to spare: the longest question is 417 tokens, leaving
+32,000 − 417 = 31,583 tokens of the state-plus-longest-question budget for history.
 
 ## Measuring the latency hypothesis
 
@@ -207,13 +253,19 @@ deltas for that call only:
 
 ```python
 watch = measure(jev, (run.take(i) for i in range(len(SCRIPT))), verify=run.verify)
-watch.p50_ms, watch.p95_ms          # measured per-check latency
+watch.p50_ms, watch.p95_ms          # measured per-check latency, end to end
 watch.within_budget()               # p95 <= CHECK_BUDGET_MS — the hypothesis, tested
 watch.usd_per_thousand_checks       # priced from the tokens the API reported
 ```
 
+Each sample is one whole check: `repeats_in` and `prepare` on your own records as well as
+the request, because all of it is time the loop step pays for. A check that never reached
+the network — an oversized request refused locally — still contributes a sample, since it
+still cost the loop its time. `jev.ledger.latencies_ms` keeps the request-only numbers when
+you want to separate the two, and the gap between them is this recipe's local cost.
+
 `within_budget()` uses p95, not the mean, because a loop is held up by its slow steps, and
-returns False when no answer landed at all: an unmeasured budget is not a met one.
+returns False when nothing was measured at all: an unmeasured budget is not a met one.
 `examples/loop_control.py` prints the whole thing for a scripted run. There is no API key
 in this repo's test environment, so no latency number here was measured against the real
 API — run the example on your own account to get one.
@@ -237,10 +289,13 @@ API — run the example on your own account to get one.
   are the next step's problem to gate (see the tool-gating recipe), and that halting on
   every uncertain check-in makes a supervisor useless. If your steps are individually
   expensive, gate them where they happen.
-- **The repeat counter is textual.** It compares what the loop logged. Two calls that
-  differ only in an argument your log omits look identical to it; two calls that do the
-  same thing with different wording look different. The `repeating` question is there to
-  cover the second case, and it is a judgment, not a proof.
+- **The repeat counter is textual, and it only reads the first `ENTRY_CHARS`.** It compares
+  what the loop logged. Two calls that differ only in an argument your log omits look
+  identical to it; two calls that do the same thing with different wording look different.
+  The `repeating` question is there to cover the second case, and it is a judgment, not a
+  proof. Two records that agree for 600 characters and diverge after that count as one
+  action — which is also all the model is shown of them, so the two signals agree, but if
+  your step records carry the distinguishing part at the end, put it at the front instead.
 - **One check per step costs a request per step.** At 1,200 requests/minute across the
   account, a supervisor at one check per step shares that ceiling with everything else on
   the key; pace it with `jevkit.RateLimiter` if you run many loops at once.

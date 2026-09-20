@@ -12,10 +12,11 @@ tries to tell the triage system which queue to use. Watch the last three: the fo
 judged on its newest message, the Swedish ticket has to clear a higher confidence floor,
 and the one giving orders goes to a person with automation off.
 
-Three numbers are printed at the end and all of them come from this run's ledger: what a
-thousand tickets cost, the same thousand priced at an LLM input price you pass in, and
-what the seven speculative questions added to one request. Change LLM_USD_PER_MTOK_IN to
-your own price — the ratio is arithmetic on your number, not a claim from this repo.
+The numbers printed at the end all come from this run's own ledger: what a thousand tickets
+cost, what a thousand requests cost (not the same figure — the empty ticket sends nothing),
+the same thousand priced at an LLM input price you pass in, and what the seven speculative
+questions added to one request. Change LLM_USD_PER_MTOK_IN to your own price — the ratio is
+arithmetic on your number, not a claim from this repo.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from jevkit.recipes.triage import (
     compare_to_llm,
     measure_speculative_overhead,
     triage_batch,
-    usd_per_1000_tickets,
+    usd_per_1000_requests,
 )
 
 #: The desk. `description` is the only thing the model reads about a category or a queue,
@@ -201,10 +202,14 @@ async def main() -> None:
     print("mix:    " + ", ".join(f"{queue} {share:.0%}" for queue, share in sorted(mix.items())))
 
     print("\ncost, measured from this run")
-    print(f"  ${usd_per_1000_tickets(result.ledger):.4f} per 1,000 tickets")
+    #: Ten tickets, nine requests: T-1006 is empty and sends nothing. Both figures are the
+    #: same spend over different denominators, so the unit is printed with the number.
+    print(f"  ${result.cost_per_1000_tickets():.4f} per 1,000 tickets ({len(result.decisions)} counted)")
+    print(f"  ${usd_per_1000_requests(result.ledger):.4f} per 1,000 requests ({result.requests} sent)")
     comparison = compare_to_llm(
         result.ledger,
         usd_per_million_input=LLM_USD_PER_MTOK_IN,
+        tickets=len(result.decisions),
         prompt_tokens_per_ticket=LLM_PROMPT_TOKENS,
         output_tokens_per_ticket=LLM_OUTPUT_TOKENS,
     )

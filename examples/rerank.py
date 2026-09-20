@@ -109,6 +109,12 @@ TOP_K = 4
 
 def show(decision: RerankDecision) -> None:
     print(f"  {decision.line()}")
+    print(
+        f"  screened: {decision.screened}"
+        f"  (unjudged {len(decision.unjudged)},"
+        f" head-only {len(decision.partly_screened)},"
+        f" premise unchecked {len(decision.contradiction_unscreened)})"
+    )
     for position, record in enumerate(decision.ranking):
         flags = f"  [{', '.join(record.reasons)}]" if record.reasons else ""
         unit = "  n/a" if record.unit is None else f"{record.unit:5.2f}"

@@ -37,11 +37,17 @@ command — `Decision.concern` is a queue label drawn from the caller's own
 configured ids and no threshold in this module reads it.
 
 Calibration is the point of shipping the raw probabilities: `Decision.signals`
-carries every per-category number, and `threshold_report` / `sweep` compute the
-flag and block rates those numbers would produce on examples the caller has
-labelled. Those functions make no claim about accuracy — they count what the
-caller's own data does at a threshold, offline, with no request at all. No
-speed-up or cost ratio against any other screener appears in this repository,
+carries every per-category number and `Decision.harm` the normalised harm
+reading, `observed` pairs either with the caller's own labels, and
+`threshold_report` / `sweep` compute the flag and block rates those numbers would
+produce on examples the caller has labelled — so every per-category flag and block
+threshold, and the harm pairs, can be moved on evidence. The confidence floor is
+not one of them: it gates on how peaked an answer is rather than on a hazard
+reading, so these helpers do not sweep it and it has to be argued from the
+`harm_confidence` values the decisions carry. Those functions make no
+claim about accuracy — they count what the caller's own data does at a threshold,
+offline, with no request at all. No speed-up or cost ratio against any other
+screener appears in this repository,
 because none has been measured here; `examples/guardrails.py` prints the latency
 and dollars of this one from `jev.ledger`.
 """
@@ -478,10 +484,14 @@ DIRECTION_SCALE: Mapping[str, float] = {
 THRESHOLD_CEILING = 0.95
 
 #: What a noul says when it knows nothing: yes and no are equally likely. No flag
-#: threshold in this block, after the direction scale, may sit above it — so an
-#: uninformative answer on any signal costs a FLAG rather than a clearance.
-#: `check_policy` enforces that, and it is why the leak and injection rows below
-#: read 0.50 where 0.55 would otherwise have been defensible.
+#: threshold may sit above it, so an uninformative answer on any signal costs a
+#: FLAG rather than a clearance. Enforced twice, because the tables in this block
+#: are not the only source of a threshold: `check_policy` keeps the hand-written
+#: rows below it — which is why the leak and injection rows read 0.50 where 0.55
+#: would otherwise have been defensible — and `effective_flag` clamps whatever
+#: threshold is actually read, so a caller-supplied `Hazard` whose flag threshold
+#: the direction scale pushes past 0.50 cannot clear an uninformative reading
+#: either.
 UNINFORMATIVE_NOUL = 0.50
 
 #: The harm Score combined with the loudest signal that reached its flag
@@ -570,6 +580,19 @@ def scaled(value: float, direction: str) -> float:
     return min(value * DIRECTION_SCALE[direction], THRESHOLD_CEILING)
 
 
+def effective_flag(flag_at: float) -> float:
+    """A flag threshold as it is actually read: never above `UNINFORMATIVE_NOUL`.
+
+    Clamping here rather than only in `check_policy` is what makes the invariant
+    hold for a `Hazard` the caller built and for the direction scale on top of it:
+    a noul carries no confidence, so a reading that knows nothing arrives as 0.50,
+    and no threshold may let that through. It only ever lowers a threshold, so it
+    cannot loosen a policy, and the lowered number is what `Decision.thresholds`
+    reports.
+    """
+    return min(flag_at, UNINFORMATIVE_NOUL)
+
+
 def thresholds_for(
     signal: str, direction: str, hazards: Mapping[str, Any]
 ) -> tuple[float, float | None, str]:
@@ -580,11 +603,11 @@ def thresholds_for(
     """
     if signal in FIXED_QUESTIONS:
         flag_at, block_at = SIGNAL_POLICY[signal][direction]
-        return flag_at, block_at, FLAG if block_at is None else BLOCK
+        return effective_flag(flag_at), block_at, FLAG if block_at is None else BLOCK
     hazard = hazards[signal]
     stops_hard = direction in BLOCK_DIRECTIONS[hazard.severity]
     return (
-        scaled(hazard.flag_at, direction),
+        effective_flag(scaled(hazard.flag_at, direction)),
         scaled(hazard.block_at, direction),
         BLOCK if stops_hard else REVIEW,
     )
@@ -692,6 +715,7 @@ def check_policy() -> list[str]:
         if unknown:
             problems.append(f"{severity}: names a direction that does not exist: {sorted(unknown)}")
     previous: float | None = None
+    previous_verdict: str | None = None
     for harm_at, signal_at, verdict, label in HARM_PAIRS:
         if verdict not in VERDICT_ORDER:
             problems.append(f"harm pair {label!r}: {verdict!r} is not a verdict")
@@ -699,14 +723,34 @@ def check_policy() -> list[str]:
             problems.append(f"harm pair {label!r}: {harm_at} and {signal_at} are not both in (0, 1]")
         if previous is not None and harm_at > previous:
             problems.append(f"harm pair {label!r}: rows must run strongest first")
+        # `decide` takes the first row both numbers satisfy and stops, so a row
+        # weaker than the one above it would let more harm reach a lower verdict.
+        if (
+            previous_verdict is not None
+            and verdict in VERDICT_ORDER
+            and previous_verdict in VERDICT_ORDER
+            and VERDICT_ORDER.index(verdict) > VERDICT_ORDER.index(previous_verdict)
+        ):
+            problems.append(
+                f"harm pair {label!r}: verdict {verdict!r} is stronger than {previous_verdict!r} "
+                "on the row above it, so less harm would stop more than more harm does"
+            )
         previous = harm_at
+        previous_verdict = verdict
+    # The unclamped table value, deliberately: `effective_flag` guarantees the
+    # behaviour, and this keeps the invariant a claim about the numbers a reviewer
+    # reads here rather than one the clamp satisfies for them.
     for signal in [*SIGNAL_POLICY, *HAZARD_POLICY]:
         for direction in DIRECTIONS:
-            flag_at, _, _ = thresholds_for(signal, direction, BUILTIN_HAZARDS)
+            if signal in SIGNAL_POLICY:
+                flag_at = SIGNAL_POLICY[signal][direction][0]
+            else:
+                flag_at = scaled(HAZARD_POLICY[signal][1], direction)
             if flag_at > UNINFORMATIVE_NOUL:
                 problems.append(
                     f"{signal}/{direction}: flag threshold {flag_at} sits above an uninformative "
-                    f"noul ({UNINFORMATIVE_NOUL}), so a reading that knows nothing would clear"
+                    f"noul ({UNINFORMATIVE_NOUL}), so only the clamp in effective_flag keeps a "
+                    "reading that knows nothing from clearing"
                 )
     if not CONFIDENCE_FLOOR_AT_NO_HARM <= CONFIDENCE_FLOOR_AT_FULL_HARM <= 1:
         problems.append("the confidence floor falls as harm rises, or leaves [0, 1]")
@@ -1175,6 +1219,11 @@ def observed(
 ) -> list[Labelled]:
     """Pair each decision's recorded probability for `signal` with the caller's label.
 
+    `signal` is any noul in the request, or `HARM_QUESTION_ID` for the normalised
+    harm reading — `HARM_ALONE_REVIEW_AT` and the `harm at` column of `HARM_PAIRS`
+    are thresholds in the review block too, so they have to be sweepable with the
+    same tooling as the rest.
+
     Raises rather than silently aligning: a label list of the wrong length, or a
     decision that never got an answer for this signal, would quietly shift every
     pair and produce a confident, wrong report.
@@ -1183,14 +1232,18 @@ def observed(
         raise ValueError(f"{len(decisions)} decisions and {len(labels)} labels do not pair up")
     pairs = []
     for position, (decision, label) in enumerate(zip(decisions, labels, strict=True)):
-        if signal not in decision.signals:
+        if signal == HARM_QUESTION_ID:
+            value = decision.harm
+        else:
+            value = decision.signals.get(signal)
+        if value is None:
             raise ValueError(
                 f"decision {position} carries no probability for {signal!r}; it was not asked, or "
                 "the screening failed closed before any answer arrived"
             )
         pairs.append(
             Labelled(
-                probability=decision.signals[signal],
+                probability=value,
                 positive=bool(label),
                 direction=decision.direction,
             )

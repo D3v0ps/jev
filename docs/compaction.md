@@ -31,7 +31,7 @@ approaches are not substitutes everywhere, and this one is a fitter, not a rewri
 ## The state, and why it is shaped that way
 
 ```json
-{"pinned": [{"role": "system", "text": "..."}],
+{"pinned": [{"role": "system", "text": "..."}, {"role": "user", "text": "Goal: ..."}],
  "blocks": {"b0": {"position": 2, "role": "tool", "text": "...", "clipped_chars": 412}},
  "window": {"pinned_shown": 3, "pinned_total": 3, "blocks_here": 11,
             "blocks_total": 11, "shard": 0, "shards": 1}}
@@ -43,11 +43,24 @@ are never dropped and never asked about — a recipe that can drop the goal is b
 they are the thing everything else is judged *against*. "Load-bearing" is a relation to a
 goal, not a property of a paragraph, so a compactor that cannot see the goal is guessing.
 
+Which means the pinned context has to survive the state's own budget. It gets
+`PINNED_STATE_TOKENS`, and when it does not all fit, the order is: the oldest pinned block
+(usually the system prompt), then the newest (usually the live request), then the middle ones
+newest first. A pinned block too long for the room left is **skipped**, not treated as the
+end of the fill — otherwise one long pinned tool doc could push a ten-token goal out of a
+state with thousands of tokens still free. `decision.pinned_shown` counts what fit and
+`decision.pinned_omitted` names what did not, so "the goal was not in the state" is something
+a caller can see in the log line instead of inferring from a weak decision. Pinned blocks
+that did not fit are still kept: this is about what was judged, not about what survives.
+
 `blocks` holds the candidates under code-minted labels. `position` is each block's index in
 the whole transcript, so a question can reason about what came after it: a block whose
 content a later block restates in full is disposable however important it looked.
-`clipped_chars` appears when a block was too long to send whole and says so, rather than
-letting the model judge a truncated block as if it were complete.
+`clipped_chars` appears — on a pinned entry as well as a candidate — when a block was too
+long to send whole and says so, rather than letting the model judge a truncated block, or a
+goal cut mid-sentence, as if it were complete. `decision.clipped_chars` totals the characters
+actually cut: the pinned context is identical in every shard, so its clipping is counted once
+however many requests the plan spends.
 
 Everything in `pinned` and `blocks` is untrusted. It is a transcript: tool output, fetched
 pages, whatever a user typed. Each question carries the same note saying so.
@@ -74,42 +87,69 @@ decision is one round trip. Three shapes of the same decision, measured — the 
 comparison is the third row, because it is the only per-block shape that gives each
 question the same information:
 
-| shape | what each request carries | tokens (11-block example) | round trips |
+| shape | what each request carries | estimated request size, 11-block example | round trips |
 | --- | --- | --- | --- |
-| one request (this recipe) | the whole transcript, 33 questions | ~9,263 | 1 |
-| one request per block, lean | pinned context plus that one block | ~10,648 (1.15x) | 11 |
-| one request per block, informed | the whole transcript, 3 questions | ~15,543 (1.68x) | 11 |
+| one request (this recipe) | the whole transcript, 33 questions | ~9,263 tokens | 1 |
+| one request per block, lean | pinned context plus that one block | ~10,648 tokens (1.15x) | 11 |
+| one request per block, informed | the whole transcript, 3 questions | ~15,543 tokens (1.68x) | 11 |
 
-The ratio grows with the transcript, because the informed per-block shape re-sends the whole
-state every time:
+The ratio against the *informed* shape grows with the transcript, because that shape re-sends
+the whole state every time:
 
 | transcript | one request | per-block lean | per-block informed |
 | --- | --- | --- | --- |
-| 11 blocks, ~30 tokens each (the example) | ~9,263 | 1.15x | 1.68x |
-| 12 blocks, ~2,000 tokens each | ~33,917 | 1.09x | 8.94x |
-| 40 blocks, ~400 tokens each | ~48,296 | 1.23x | 14.64x |
-| 80 blocks, ~100 tokens each | ~72,599 (2 shards) | 1.30x | 11.35x |
+| 11 blocks, ~31 tokens each (the example) | ~9,263 | 1.15x | 1.68x |
+| 12 blocks, ~2,000 tokens each | ~33,624 | 1.02x | 8.92x |
+| 40 blocks, ~400 tokens each | ~47,975 | 1.04x | 14.47x |
+| 80 blocks, ~100 tokens each | ~71,954 (2 shards) | 1.05x | 11.00x |
 
-All of these are **estimates of request size** from `jevkit.limits.estimate_tokens` — a
-characters-per-token ratio, not a tokenizer — computed offline over the requests `plan()`
-actually builds, for the transcript in `examples/compaction.py` and for three synthetic
-shapes. They are not metered usage: run `examples/compaction.py` with a key and it prints
-what the API reported next to what the estimator predicted.
+Every number in both tables is **an estimate of request size** from
+`jevkit.limits.estimate_tokens` — a ~4-characters-per-token ratio, not a tokenizer — over the
+request bodies `plan()` and `build_questions()` actually build. None of it is metered usage.
+Reproduce all of it offline, with no key:
 
-Two things the table does not flatter:
+```
+.venv/bin/python -c "import examples.compaction as ex; ex.print_offline_numbers()"
+```
 
-- Against the *lean* per-block shape, one request saves 9–30% of the tokens, not orders of
-  magnitude. The questions dominate this recipe's request (~785 estimated tokens per block
-  for all three), so most of what is sent is the same three questions repeated. The win
-  against that baseline is the round trips, and the information: a lean per-block request
-  cannot answer "another block already says this", because it never sees the other blocks.
-- 785 tokens of questions per block is also what sets the shard size. 48 blocks is ~37,700
-  tokens of questions before any state.
+Row 1 is the transcript in `examples/compaction.py`; rows 2–4 are
+`examples.compaction.uniform_transcript(blocks, tokens_each)` over the shapes in
+`DOC_SHAPES` there. Run `examples/compaction.py` with a key and it prints what the API
+reported next to what the estimator predicted.
+
+Three things the table does not flatter:
+
+- Against the *lean* per-block shape there is barely a token saving: on these four shapes
+  the lean shape costs 2–15% more in total, not orders of magnitude more. The questions
+  dominate this recipe's request
+  (~785 estimated tokens per block, for all three shapes), so most of what is sent is the
+  same three questions repeated. The win against that baseline is the round trips, and the
+  information: a lean per-block request cannot answer "another block already says this",
+  because it never sees the other blocks.
+- That lean ratio depends on how much context is pinned, because the lean shape re-sends the
+  pinned blocks in every request. Rows 2–4 pin a single short goal, which is the least
+  favourable case for this recipe; row 1 pins three blocks and shows 1.15x. Measure it on
+  your own transcript rather than taking a row of this table.
+- ~785 tokens of questions per block is also what sets the shard size:
+  `MAX_BLOCKS_PER_SHARD` is `SHARD_TOTAL_TOKENS // QUESTION_TOKENS_PER_BLOCK` = 76 today,
+  which is ~59,660 tokens of questions — 228 of them — before any state.
 
 ## Thresholds
 
-All of them live in the one review block at the top of the module. Every row is exercised on
-both sides in `tests/test_compaction.py`.
+All of them live in the one review block at the top of the module. The four rows that decide
+a block's fate — `DEPENDS_LATER_TRUE`, `CONFIDENCE_FLOOR_DROP`, `STEERING_SUSPECTED` and
+`STEERING_VALUE_CAP` — are exercised on both sides in `tests/test_compaction.py`, and so is
+`MAX_SHARDS` (a plan needing exactly that many shards is not truncated; one block more is
+reported unjudged and kept). The rest are structural or margins and are tested on one side
+only, which the "which way it fails" column names: `UNJUDGED_VALUE` and `VALUE_LEVELS` have no
+other side, `PINNED_STATE_TOKENS` and `BLOCK_CHARS_BUDGET` are tested by what they report, and
+`SHARD_TOKEN_RESERVE` is tested by every planned request fitting the documented budget — no
+offline test can show how far a 4-characters-per-token estimate is from the real tokenizer,
+which is the other thing that margin is for. `QUESTION_TOKENS_PER_BLOCK` and
+`MAX_BLOCKS_PER_SHARD` are measured and derived rather than chosen, so what the tests check is
+the derivation itself and the sharding boundary it produces: a transcript that fits one
+request gets one, and the first transcript that gets two is the first one a single request
+could not have held.
 
 | threshold | value | what it gates | which way it fails |
 | --- | --- | --- | --- |
@@ -119,10 +159,11 @@ both sides in `tests/test_compaction.py`.
 | `STEERING_SUSPECTED` | 0.60 | Probability at which a block reads as addressing the compactor. A flagged block loses its protection. | toward dropping the flagged block |
 | `STEERING_VALUE_CAP` | 0.25 | The value a flagged block is capped at, whatever it scored. Above disposable and below background: it keeps its place if there is room and cannot buy space it did not earn. | toward dropping the flagged block |
 | `UNJUDGED_VALUE` | 1.0 | The value given to a block no usable answer arrived for. The top of the scale, so an unanswered question costs tokens, never content. | toward keeping |
-| `MAX_BLOCKS_PER_SHARD` | 48 | Blocks judged in one request; also a ceiling of 144 questions per request. | — |
+| `QUESTION_TOKENS_PER_BLOCK` | ~785 tokens | Measured at import with `limits.estimate_tokens` over what `build_questions` builds, not written down. Edit the questions and it follows. | — |
+| `MAX_BLOCKS_PER_SHARD` | `SHARD_TOTAL_TOKENS // QUESTION_TOKENS_PER_BLOCK` = 76 | The most candidates one request will carry. Derived, not chosen: a smaller hand-picked ceiling splits transcripts that fit one request, which buys a round trip and the cross-shard incomparability below for nothing. It is an upper bound rather than the usual trigger — the state costs tokens too, so the token budgets are normally reached a block or two earlier. | — |
 | `MAX_SHARDS` | 8 | Requests one compaction will ever spend. Blocks past this are reported unjudged and kept. | toward keeping |
-| `SHARD_TOKEN_RESERVE` | 4,000 tokens | Held back from both documented per-request budgets for the questions and the envelope, leaving `SHARD_STATE_TOKENS` = 28,000 and `SHARD_TOTAL_TOKENS` = 60,000. | — |
-| `PINNED_STATE_TOKENS` | 8,000 tokens | The share of a shard's state spent on pinned context. The most recent pinned blocks are shown first, and at least one always is. | reports `pinned_shown` |
+| `SHARD_TOKEN_RESERVE` | 4,000 tokens | Held back from both documented per-request budgets for the JSON envelope and for the estimator being wrong, leaving `SHARD_STATE_TOKENS` = 28,000 and `SHARD_TOTAL_TOKENS` = 60,000. A request that overruns the real limit is refused locally and nothing is compacted, so the margin fails toward keeping. | toward keeping |
+| `PINNED_STATE_TOKENS` | 8,000 tokens | The share of a shard's state spent on pinned context, filled oldest, then newest, then the middle by recency, skipping a block too long for the room left. At least one is always shown. | reports `pinned_shown` and `pinned_omitted` |
 | `BLOCK_CHARS_BUDGET` | 8,000 characters | How much of one block's text reaches the state. Clipping is for judging only: the block itself is still kept or dropped whole, and the characters cut are reported. | reports `clipped_chars` |
 
 Note which way each one fails. Dropping is the destructive direction, so every uncertain
@@ -170,12 +211,17 @@ regression in this recipe debuggable: the answers and the fill are separately in
 
 ## Sharding, and what it costs
 
-A transcript that does not fit one request's state budget is split: `plan()` packs candidates
-in transcript order until a shard hits `MAX_BLOCKS_PER_SHARD` or the documented token
-budgets, and `decide()` merges the replies by label. This is the one place this repo sends
+A transcript that does not fit one request is split: `plan()` packs candidates in transcript
+order until a shard reaches the documented token budgets less `SHARD_TOKEN_RESERVE` — or the
+block count those budgets imply, `MAX_BLOCKS_PER_SHARD`, which is derived from them and never
+smaller — and `decide()` merges the replies by label. This is the one place this repo sends
 more than one request per decision, and it qualifies because the shards are independent — no
 shard's questions depend on another shard's answer, each one carries the same pinned context,
 and the merge is code.
+
+The trigger is the budget and nothing else. A transcript of sixty short blocks is one request;
+`tests/test_compaction.py` pins that, and pins that the first transcript which does get a
+second request is the first one whose single request would not have fit.
 
 It is not free, and two costs are real:
 
@@ -198,8 +244,10 @@ unjudged are the newest ones — which recency would have kept anyway. They are 
 ## Cost arithmetic
 
 Jev is priced by `jevkit.cost` at $0.042 per million input tokens, output free. The fee is
-charged **once** per compaction; the saving is charged back on **every** later request that
-sends the smaller context. So the verdict turns on reuse:
+charged **once** per compaction — `jev_usd_from(ledger, shards=decision.shards)` returns what
+one whole compaction cost, which for a sharded run is every request it spent, not the average
+of them. The saving is charged back on **every** later request that sends the smaller context.
+So the verdict turns on reuse:
 
 ```
 saving = tokens_saved x usd_per_token x reuses
@@ -207,13 +255,22 @@ net    = saving - jev_usd
 break-even reuses = jev_usd / (tokens_saved x usd_per_token)
 ```
 
-`expected_cost(decision, usd_per_token=…, reuses=…, jev_usd=jev_usd_from(jev.ledger))` does
-that arithmetic with the caller's own downstream price and a fee measured from the ledger,
-and `report.pays` can be — and is — False.
+`expected_cost(decision, usd_per_token=…, reuses=…, jev_usd=jev_usd_from(jev.ledger,
+shards=decision.shards))` does that arithmetic with the caller's own downstream price and a
+fee measured from the ledger, and `report.pays` can be — and is — False.
 
-Worked example, computed offline with `jevkit.limits.estimate_tokens`, `jevkit.cost` and the
-test harness over the transcript in `examples/compaction.py` (the answers were scripted, not
-the model's; run the example with a key for metered numbers):
+Worked example over the transcript in `examples/compaction.py`. Reproduce it offline, with no
+key:
+
+```
+.venv/bin/python -c "import examples.compaction as ex; ex.print_offline_numbers()"
+```
+
+The answers are the ones written out in `DOC_ANSWERS` in that file — a plausible reading of
+the transcript, **not** the model's output — scripted through `jevkit.testing` so the request
+is really encoded and the fill really runs. The input tokens are
+`jevkit.limits.estimate_tokens` over that encoded body, priced by `jevkit.cost`; they are an
+estimate, not metered usage. Run the example with a key for the metered numbers.
 
 | | |
 | --- | --- |
@@ -229,23 +286,25 @@ the model's; run the example with a key for metered numbers):
 At $3/Mtok downstream, this compaction pays back before the next request finishes. Two ways
 it does not:
 
-- **A cheap downstream model.** At $0.042/Mtok — the same price as Jev — break-even is ~45
+- **A cheap downstream model.** At $0.042/Mtok — the same price as Jev — break-even is ~44.75
   reuses, because the fee is measured against a saving priced the same as the fee.
 - **A small saving.** Break-even scales inversely with the tokens freed: a compaction that
   frees 20 instead of 207 needs ten times the reuses at the same price. When nothing was
   dropped at all, `break_even_reuses` is None and `expected_cost` says so rather than
   reporting a ratio.
 
-The other half of the cost is latency, and the ledger measures it: `jev.ledger.p50_ms` and
-`p95_ms` are what the caller waited, and a sharded compaction sent through `compact_async`
-waits once rather than per shard. `decision.latencies_ms` holds each request's own.
+The other half of the cost is latency. This repo quotes no latency figure, because none can
+be produced without a key: `jev.ledger.p50_ms` and `p95_ms` are what *your* caller waited, a
+sharded compaction sent through `compact_async` waits once rather than per shard, and
+`decision.latencies_ms` holds each request's own.
 
 ## Honest limits
 
 - **Greedy is not optimal.** Value-per-token fill is a knapsack heuristic. It can pass over
   a long load-bearing block and fill the room with three short useful ones — in the worked
-  example above it drops a 45-token "useful" block and keeps a 27-token "background" one,
-  because the larger one no longer fit. If a block must survive, pin it; that is what
+  example above it drops the 45-token "useful" `thinking` block and keeps the 27-token
+  "background" `history` one, because the larger one no longer fit (both numbers come out of
+  the offline run above). If a block must survive, pin it; that is what
   pinning is for. An exact knapsack would be a different, slower, still-heuristic policy.
 - **It cannot compress a block.** A single 30,000-token tool result is kept or dropped whole.
   Where the content has to shrink rather than go, a summariser is the right tool and this

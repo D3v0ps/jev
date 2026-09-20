@@ -111,8 +111,9 @@ All of them live in the review block at the top of the module.
 | `FLOOR_AT_NO_STAKES` | 0.55 | confidence needed to act when `stakes` is 0 (read-only screen) |
 | `FLOOR_AT_FULL_STAKES` | 0.92 | confidence needed to act when `stakes` is 1 (irreversible) |
 | `CONTROL_CONFIDENCE_FLOOR` | 0.50 | confidence needed for `DONE` or `BLOCKED` to end the run |
+| `STAKES_TAIL_MASS` | 0.15 | how much mass at or above a stakes level makes that level set the floor |
 | `TARGET_MARGIN_MIN` | 0.15 | how far the best target must lead the runner-up |
-| `INJECTION_BLOCK` | 0.60 | above this, the screen is treated as compromised |
+| `INJECTION_BLOCK` | 0.60 | **at or above** this, the screen is treated as compromised |
 | `GOAL_EVIDENCE_CONFIRMED` | 0.70 | below this, a `DONE` is downgraded to `ASK_OPERATOR` |
 | `MAX_HEAD_OPTIONS` | 255 (`limits.CHOICE_MAX_OPTIONS`) | candidates offered per head |
 | `LABEL_CHARS` / `VALUE_CHARS` | 160 / 80 | element text sent per field |
@@ -123,8 +124,36 @@ FLOOR_AT_NO_STAKES) * stakes`, and the confidence it is compared against is the
 goes through on a search-results page and goes to a human on a payment screen.
 That is the whole point of scoring the stakes instead of hard-coding one number.
 
+### The stakes a floor is set from is not the mean
+
+A Score answer is a distribution, and `reply.unit()` hands back its
+probability-weighted mean. Half the mass on "Read-only" and half on
+"Irreversible" has the *same mean* as a confident "Reversible" — so setting the
+floor from the mean alone makes the recipe most permissive exactly where the
+model is least sure about the one input that governs irreversible side effects.
+An attacker-reachable screen would only have to read as ambiguous, not as safe.
+
+So `gating_stakes()` takes the worse of two readings of the same answer, with no
+extra question and no extra request — the distribution is already in the reply:
+
+- the **mean**, because mass spread over the middle levels is a real risk that no
+  single tail level captures;
+- the **upper tail**: the highest level whose cumulative mass counted down from
+  the top reaches `STAKES_TAIL_MASS` (0.15), normalised to 0..1.
+
+On that coin-flip answer the tail is level 3, so the floor is 0.92 and a
+0.78-confidence click goes to a human instead of moving the money. `Decision`
+carries both: `stakes` is the mean, `stakes_gate` is what the floor was computed
+from. A Score whose levels cannot be read as indices at all gates at 1.0.
+
 `WAIT` is deliberately not gated: waiting touches nothing, and the next
 observation will be a better question than a confidence threshold.
+
+A target head offering a **single candidate** has no runner-up, so
+`Decision.margin` is `None` and `TARGET_MARGIN_MIN` does not apply: that step is
+gated by the operation head and the stakes floor alone. Reporting the winner's
+own probability there would put a 1.00 "lead" on a decision that was never a
+comparison.
 
 ### Failing closed
 
@@ -134,6 +163,7 @@ Every path that is not a clean, confident answer ends in `ASK_OPERATOR` or
 - a rejected or missing answer (`AnswerRejected`);
 - a request that fails, including one rejected locally for size;
 - confidence under the floor, or two targets within `TARGET_MARGIN_MIN`;
+- an ambiguous `stakes` answer, which raises the floor rather than averaging out;
 - `instruction_injection` at or above `INJECTION_BLOCK`, *even when the operation
   and target are near-certain*;
 - `DONE` without evidence on the screen.
@@ -159,21 +189,32 @@ From `jevkit.cost`: `jev-1.13.0` costs **$0.042 per million input tokens**, and
 output tokens are free. One decision is one request, so the cost of a step is the
 cost of its input.
 
-These token counts come from `jevkit.limits.estimate_tokens`, which is a
-deliberately conservative 4-characters-per-token estimate of the request this
-recipe builds, priced with `jevkit.cost.usd_for`. **They are local estimates of
-this repo's own payloads, not measurements of a live API response**; run the
-example with a key for billed numbers.
+Every number in this section was produced by the two scripts below, run against
+this repo. They count the request `build_state` and `build_questions` actually
+produce, with `jevkit.limits.estimate_tokens` — a deliberately conservative
+**~4-characters-per-token estimate, not a tokenizer** — and price it with
+`jevkit.cost.usd_for`. **They are local estimates of this repo's own payloads,
+not measurements of a live API response**; run the example with a key for billed
+numbers. Re-run the scripts after changing any instruction text: the counts move
+with the wording.
+
+The screens are synthetic: `count` elements labelled `Result <i>`, each offering
+`operations`, with the goal `"buy the red mug"` and no history. Your own labels
+are longer, so treat these as a floor.
 
 | screen | heads | questions | estimated input tokens | $/decision | $/10,000 decisions |
 | --- | --- | --- | --- | --- | --- |
-| 12 clickable links | 1 | 5 | 1,329 | $0.0000558 | $0.56 |
-| 40 clickable links | 1 | 5 | 2,393 | $0.0001005 | $1.01 |
-| 40 links, 3 ops each | 3 | 7 | 3,398 | $0.0001427 | $1.43 |
-| 120 clickable links | 1 | 5 | 5,453 | $0.0002290 | $2.29 |
-| 255 clickable links | 1 | 5 | 10,718 | $0.0004502 | $4.50 |
+| 12 clickable links | 1 | 5 | 1,130 | $0.00004746 | $0.47 |
+| 40 clickable links | 1 | 5 | 1,781 | $0.00007480 | $0.75 |
+| 40 links, `CLICK`+`HOVER`+`SCROLL_TO` | 3 | 7 | 2,786 | $0.00011701 | $1.17 |
+| 120 clickable links | 1 | 5 | 3,661 | $0.00015376 | $1.54 |
+| 255 clickable links | 1 | 5 | 6,934 | $0.00029123 | $2.91 |
 
-Reproduce a row:
+The three-head row names its operations because the count depends on which
+instruction text is sent: the same 40 elements with `CLICK`+`HOVER` alone come to
+2,266 tokens, not 2,786.
+
+Reproduce the whole table:
 
 ```python
 from jevkit import cost, limits
@@ -184,20 +225,31 @@ from jevkit.recipes.action_selection import (
     build_state,
 )
 
-screen = tuple(
-    Candidate(role="link", label=f"Result {i}", operations=("CLICK",), handle=f"#r{i}")
-    for i in range(40)
-)
-space = build_action_space(screen)
-questions = build_questions(space)
-tokens = limits.check_request(build_state("buy the red mug", space), questions)
-print(len(questions), "questions,", tokens, "estimated input tokens")
-print("one decision: $%.8f" % cost.usd_for("jev-1.13.0", tokens))
+GOAL = "buy the red mug"
+ROWS = (("12 links", 12, ("CLICK",)),
+        ("40 links", 40, ("CLICK",)),
+        ("40 links, 3 ops", 40, ("CLICK", "HOVER", "SCROLL_TO")),
+        ("120 links", 120, ("CLICK",)),
+        ("255 links", 255, ("CLICK",)))
+
+for name, count, operations in ROWS:
+    screen = tuple(
+        Candidate(role="link", label=f"Result {i}", operations=operations, handle=f"#r{i}")
+        for i in range(count)
+    )
+    space = build_action_space(screen)
+    questions = build_questions(space)
+    tokens = limits.check_request(build_state(GOAL, space), questions)
+    usd = cost.usd_for("jev-1.13.0", tokens)
+    print(f"{name}: {len(questions)} questions, {tokens} tokens, ${usd:.8f}, ${usd * 10_000:.2f}/10k")
 ```
 
 ```
-5 questions, 1781 estimated input tokens
-one decision: $0.00007480
+12 links: 5 questions, 1130 tokens, $0.00004746, $0.47/10k
+40 links: 5 questions, 1781 tokens, $0.00007480, $0.75/10k
+40 links, 3 ops: 7 questions, 2786 tokens, $0.00011701, $1.17/10k
+120 links: 5 questions, 3661 tokens, $0.00015376, $1.54/10k
+255 links: 5 questions, 6934 tokens, $0.00029123, $2.91/10k
 ```
 
 Where the tokens go, for a 40-element screen where every element takes `CLICK`
@@ -212,6 +264,20 @@ and `HOVER` (2,266 tokens total):
 | `stakes` | 179 |
 | `instruction_injection` | 113 |
 | `goal_evidence` | 85 |
+
+```python
+screen = tuple(
+    Candidate(role="link", label=f"Result {i}", operations=("CLICK", "HOVER"), handle=f"#r{i}")
+    for i in range(40)
+)
+space = build_action_space(screen)
+questions = build_questions(space)
+state = build_state("buy the red mug", space)
+print("state", limits.estimate_tokens(state))
+for qid, question in questions.items():
+    print(qid, limits.estimate_tokens(question))
+print("total", limits.check_request(state, questions))
+```
 
 Two things follow. On a small screen the **fixed instruction text dominates** —
 the four non-target questions cost ~700 tokens whatever the page looks like — so
@@ -234,6 +300,12 @@ one `jev.ledger` prints on a keyed run: `p50`, `p95`, and
   for a harmless click on the same screen. That is conservative in the safe
   direction and it *will* send some easy steps to a human. Per-operation stakes
   heads would be more precise and would cost one more head per operation.
+- **`STAKES_TAIL_MASS` is a policy, not a fact.** Reading the floor off the upper
+  tail costs recall: a screen with a 15% chance of being irreversible is gated as
+  if it were irreversible, and some of those steps a human did not need to see.
+  A tail thinner than the constant falls back to the mean, so 0.1 of mass on
+  "Irreversible" still acts at a low floor. If that is the wrong trade on your
+  screens, it is one number, and a labelled replay will tell you which way.
 - **`DONE` is never proof.** `Decision.needs_independent_check` is set on every
   `DONE`, and `goal_evidence` only measures whether the screen *looks* finished.
   A page can say "Order placed" and be lying, or say nothing while the order went

@@ -16,17 +16,28 @@ cheap:
   wrong answer; routing too high buys a more expensive right one. So every uncertain
   path here moves *up* the ladder: a confidence below the floor escalates one rung, and
   a rejected answer, a refused request or an unexpected failure go to the top of the
-  ladder, which is where the caller puts the handler it is willing to be wrong with.
+  ladder, which is where the caller puts the handler it is willing to be wrong with. When
+  the floor is missed with nowhere further up, the handler stands and the reason is
+  `low_confidence` anyway, because a route taken without the confidence it wanted is not
+  the same event as one taken with it.
 - **The floor scales with the stakes.** A cheap route for a throwaway question and a
   cheap route for something that could hurt someone do not share a number. When the
   safety question fires, the confidence a downward route needs rises.
 - **Capability gates are hard constraints, not preferences.** Tools, fresh data,
   approval for sensitive work and required reasoning depth remove handlers from the
   eligible set in code. The model's pick is then checked against that set; a pick the
-  gates rule out is escalated, never honoured.
+  gates rule out is never honoured, and neither is a fallback that would sidestep them —
+  every path that cannot use the pick lands on the strongest *eligible* handler, not on
+  the top of the ladder regardless of the gates. `sensitive_ok` is the one claim that
+  holds even where there are no answers to gate on: with nothing usable back from Jev,
+  the request might be anything, so the fallback is the strongest handler the caller
+  approved for sensitive work. The gates can force the recipe's one route *down* — when
+  nothing eligible is as strong as the pick — and `downgraded` says so rather than
+  logging it as an escalation.
 - **The request is untrusted.** A request that asks to be routed to the cheap model, or
   that arrives dressed as configuration, is a request trying to pick its own handler.
-  One question covers exactly that, and it escalates to the top of the ladder.
+  One question covers exactly that, and the route it loses goes to the strongest handler
+  the gates allow — the gates, because this path is the one an attacker can trigger.
 
 Whether routing is cheaper than sending everything to the strong handler is arithmetic,
 not a property of the pattern: routing adds Jev's fee to *every* request and pays for
@@ -43,6 +54,7 @@ traffic can be shadow-routed to the second choice and the misroute rate that
 
 from __future__ import annotations
 
+import json
 import math
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -53,7 +65,7 @@ from typesafe_sdk import Choice, Noul, Score
 
 from .. import limits
 from ..answers import Reply
-from ..errors import AnswerRejected, JevkitError
+from ..errors import AnswerRejected, JevkitError, RequestTooLarge
 from ..ledger import Ledger
 
 # --- questions and thresholds (review this block) ---------------------------
@@ -102,7 +114,9 @@ NEEDS_FRESH_DATA_TRUE = 0.60
 SAFETY_SENSITIVE_TRUE = 0.40
 #: Probability at or above which the request reads as an attempt to steer the router
 #: rather than as work to be routed. Requests are attacker-reachable text; when they
-#: address the routing decision, the route goes to the top of the ladder.
+#: address the routing decision, the route goes to the strongest handler the capability
+#: gates allow — up the ladder, but never around the gates, because this is the path an
+#: attacker can reach for.
 STEERING_SUSPECTED = 0.60
 
 #: Normalised depth (0..1) at or above which the cheapest rung of the ladder is not
@@ -116,27 +130,61 @@ DEPTH_NEEDS_THE_TOP = 0.70
 #: measured from integer counts is accepted and a mix that forgot a handler is not.
 MIX_SUM_TOLERANCE = 0.01
 
-#: Tokens of the 32k state-plus-longest-question budget held back for the questions and
-#: for the rest of the state, leaving the remainder for the request text.
+#: Tokens of the 32k state-plus-longest-question budget held back for the questions, and
+#: so the ceiling on how much request text is ever sent. A ceiling, not the clip itself:
+#: the handler question grows with the registry, so the clip is measured per request by
+#: `request_chars_budget` and this number only caps it.
 STATE_TOKEN_RESERVE = 4_000
-#: Characters of request text that reach the state. A longer request is clipped and the
-#: number of characters cut is reported on the Decision; nothing is dropped in silence.
+#: The most request text that ever reaches the state, whatever the registry costs. A
+#: longer request is clipped and the number of characters cut is reported on the
+#: Decision; nothing is dropped in silence.
 STATE_CHARS_BUDGET = (
     limits.STATE_PLUS_LONGEST_QUESTION_TOKENS - STATE_TOKEN_RESERVE
 ) * limits.CHARS_PER_TOKEN
+#: Tokens held back for the parts of the state that are not the request text: `context`,
+#: `channel`, `truncated`, and the JSON around them. `context` belongs to the caller and
+#: can be any size, so this covers the small fixed part and an oversized `context` is
+#: refused by `limits.check_request` rather than clipped behind the caller's back.
+STATE_OVERHEAD_RESERVE = 1_000
 
 
-def build_state(task: Task) -> tuple[dict[str, Any], int]:
+def request_chars_budget(questions: Mapping[str, Any]) -> int:
+    """Characters of request text that fit beside the questions actually built.
+
+    A fixed reserve is a promise the request cannot keep: 255 described handlers make a
+    handler question of thousands of tokens, and a request clipped to a constant budget
+    then fails the local size check, turning every long request into an uncheckable
+    escalation. So the longest question is measured and the request is clipped to what is
+    left of the state-plus-longest-question budget, never above `STATE_CHARS_BUDGET`.
+    """
+    longest = max((limits.estimate_tokens(question) for question in questions.values()), default=0)
+    room = limits.STATE_PLUS_LONGEST_QUESTION_TOKENS - longest - STATE_OVERHEAD_RESERVE
+    return max(0, min(STATE_CHARS_BUDGET, room * limits.CHARS_PER_TOKEN))
+
+
+def build_state(task: Task, *, budget: int = STATE_CHARS_BUDGET) -> tuple[dict[str, Any], int]:
     """The material every question sees, and how many characters were cut to make it fit.
 
     `request` and `context` are untrusted: they are whatever a user or an upstream
     system sent. They are here to be judged, never to be followed. `channel` is the
     caller's own label for where the request arrived, so it is trusted, and `truncated`
-    tells the model that it is looking at the head of a longer request.
+    tells the model that it is looking at the head of a longer request. `budget` is the
+    room the questions left for the request text: `request_chars_budget(questions)`.
     """
-    cut = max(0, len(task.text) - STATE_CHARS_BUDGET)
+    # The budget is a character count, but the size this request has to meet is measured on
+    # the *serialised* state, where every quote, backslash, newline and tab costs two
+    # characters. A pasted log or transcript is mostly those, so clipping on the raw length
+    # leaves a state that still does not fit - and a request that does not fit is escalated
+    # unread, which is the failure this budget exists to prevent. Shrink until it measures.
+    kept = task.text[:budget]
+    for _ in range(4):
+        overshoot = len(json.dumps(kept, ensure_ascii=False)) - 2 - budget
+        if overshoot <= 0 or not kept:
+            break
+        kept = kept[: max(0, len(kept) - overshoot)]
+    cut = len(task.text) - len(kept)
     state = {
-        "request": task.text[:STATE_CHARS_BUDGET],
+        "request": kept,
         "context": task.context,
         "channel": task.channel,
         "truncated": bool(cut),
@@ -253,7 +301,10 @@ def build_questions(options: Mapping[str, Any]) -> dict[str, Any]:
 # --- end of review block ----------------------------------------------------
 
 
-#: Why a request went where it did. Everything but "routed" moved it up the ladder.
+#: Why a request went where it did. Only "routed" is the pick honoured on confidence;
+#: the rest moved the request up the ladder, held it there without the confidence a
+#: route down needs, or — when the gates left nothing as strong as the pick — moved it
+#: down, which the Decision marks `downgraded`.
 Reason = Literal[
     "routed",
     "low_confidence",
@@ -288,9 +339,12 @@ class Handler:
 class Registry:
     """The handlers a caller is willing to route to, held cheapest first.
 
-    The last handler at the highest tier is the top of the ladder, and every uncertain
-    path in this recipe lands on it: put the handler you are willing to be wrong with
-    there — a frontier model, or a human queue.
+    The last handler at the highest tier is the top of the ladder, and an uncertain path
+    in this recipe lands on it or on the strongest handler that satisfies the gates: put
+    the handler you are willing to be wrong with there — a frontier model, or a human
+    queue — and mark it `sensitive_ok` if you want it to catch the requests nobody could
+    check. A top rung marked unfit for sensitive work does not get them; the strongest
+    rung that is marked fit does, and the Decision's detail names the swap.
     """
 
     def __init__(self, handlers: Iterable[Handler]) -> None:
@@ -337,9 +391,10 @@ class Registry:
     ) -> tuple[Handler, ...]:
         """The handlers that could actually do this request, cheapest first.
 
-        May be empty: when no handler satisfies the gates, the caller decides what that
-        means, and `decide` turns it into an escalation to the top of the ladder rather
-        than into a route nobody checked.
+        May be empty: when no handler satisfies the gates, `decide` reports
+        `reason="not_eligible"` with an empty `eligible` and falls back to the strongest
+        handler the caller stands behind, rather than to a route nobody checked. Count
+        that reason — an empty eligible set means this registry cannot serve that request.
         """
         kept = list(self.handlers)
         if tools:
@@ -350,7 +405,11 @@ class Registry:
             kept = [handler for handler in kept if handler.sensitive_ok]
         if depth >= DEPTH_NEEDS_THE_TOP:
             kept = [handler for handler in kept if handler.tier == self.strongest.tier]
-        elif depth >= DEPTH_NEEDS_A_MODEL:
+        elif depth >= DEPTH_NEEDS_A_MODEL and self.strongest.tier > self.cheapest.tier:
+            #: Only when the ladder has a stronger rung to insist on. On a flat ladder —
+            #: one handler, or several lateral ones sharing a tier — "not the cheapest
+            #: tier" means "nothing", and emptying the set would report every request
+            #: above lookup depth as one no handler could take. The flag gates still apply.
             kept = [handler for handler in kept if handler.tier > self.cheapest.tier]
         return tuple(kept)
 
@@ -368,10 +427,12 @@ class Task:
 class RouteDecision:
     """Where the request goes, and the evidence that sent it there.
 
-    The evidence fields are None on the paths where no usable answer arrived, which is
-    how a log line separates "chose the cheap handler" from "could not choose, so paid
-    for the expensive one". `floor_met` answers the question a reviewer actually asks of
-    a router: was this route taken on confidence, or in spite of the lack of it?
+    The evidence fields are None — and `eligible` empty — on the paths where no usable
+    answer arrived, which is how a log line separates "chose the cheap handler" from
+    "could not choose, so paid for the expensive one". `floor_met` answers the question a
+    reviewer actually asks of a router: was this route taken on confidence, or in spite of
+    the lack of it? `downgraded` answers the other one: did this route go *down* from the
+    pick, which the gates can force and nothing else here ever does.
     """
 
     handler: str
@@ -393,21 +454,24 @@ class RouteDecision:
     truncated_chars: int = 0
     latency_ms: float | None = None
     detail: str = ""
+    downgraded: bool = False
 
     @property
     def escalated(self) -> bool:
         """True when the route is not simply the Choice's pick honoured on confidence.
 
         Every one of those paths moved up the ladder, or was already at the top of it and
-        had nowhere further to go.
+        had nowhere further to go — which is why a missed floor with nowhere to go reports
+        `reason="low_confidence"` rather than `"routed"`. The one exception is the route
+        the gates force *down*: it is not an escalation and says so as `downgraded`.
         """
-        return self.reason != "routed"
+        return self.reason != "routed" and not self.downgraded
 
     def line(self) -> str:
         """One log line: where it went, why, and on what evidence."""
         parts = [f"{self.handler} ({self.reason})"]
         if self.picked is not None and self.picked != self.handler:
-            parts.append(f"up from {self.picked}")
+            parts.append(f"{'down' if self.downgraded else 'up'} from {self.picked}")
         if self.confidence is not None and self.required_confidence is not None:
             met = "met" if self.floor_met else "missed"
             parts.append(f"confidence {self.confidence:.2f} {met} floor {self.required_confidence:.2f}")
@@ -449,10 +513,55 @@ def offer(registry: Registry) -> tuple[dict[str, Any], tuple[str, ...]]:
 
 
 def prepare(task: Task, registry: Registry) -> tuple[dict[str, Any], dict[str, Any], tuple[str, ...], int]:
-    """The one request this decision takes: state, questions, handlers not offered, characters cut."""
+    """The one request this decision takes: state, questions, handlers not offered, characters cut.
+
+    The questions are built first because they decide how much of the request fits beside
+    them: a wide registry with described handlers takes room the request cannot also have.
+    """
     options, dropped = offer(registry)
-    state, cut = build_state(task)
-    return state, build_questions(options), dropped, cut
+    questions = build_questions(options)
+    budget = request_chars_budget(questions)
+    state, cut = build_state(task, budget=budget)
+    if task.text and not state["request"]:
+        # The questions ate the whole budget. Asking the model to route an empty string
+        # would get a confident answer about nothing, and it picks the cheapest option.
+        raise RequestTooLarge(
+            "the handler question leaves no room for the request text, so there is nothing to judge"
+        )
+    return state, questions, dropped, cut
+
+
+def _stood_behind(registry: Registry, *, sensitive: bool | None) -> tuple[Handler, str]:
+    """The strongest rung the caller stands behind, plus a note when that is not the top one.
+
+    `sensitive_ok` is a safety claim the caller makes rather than a capability, so it
+    outlives the answers: when the request may be safety-sensitive — including when no
+    answer arrived to say either way — the fallback is the strongest handler the caller
+    approved for that work. A route nobody could check never lands on a rung the caller
+    declared unfit for harm, even though that can mean a weaker rung than the top one.
+    """
+    if sensitive is False:
+        return registry.strongest, ""
+    # Bounded from below as well as above. A caller may legitimately approve only the
+    # cheapest rung for sensitive work - a reviewed canned answer is safe where a
+    # frontier model is not - and picking the strongest *approved* rung would then send
+    # every unroutable request to the cheapest handler on the ladder. That is the
+    # failure this whole path exists to prevent, so the cheapest tier is not a fallback.
+    tiered = registry.strongest.tier > registry.cheapest.tier
+    approved = [
+        handler
+        for handler in registry.handlers
+        if handler.sensitive_ok and not (tiered and handler.tier == registry.cheapest.tier)
+    ]
+    if not approved:
+        return registry.strongest, (
+            "; no rung above the cheapest is approved for sensitive work, so this is the "
+            "caller's strongest rung and nothing more"
+        )
+    top = approved[-1]
+    if top.tier < registry.strongest.tier:
+        return top, f"; {registry.strongest.id} is stronger but not approved for sensitive work"
+    return top, ""
 
 
 def to_the_top(
@@ -462,26 +571,62 @@ def to_the_top(
     dropped: tuple[str, ...] = (),
     truncated_chars: int = 0,
 ) -> RouteDecision:
-    """The fail-closed route: the top of the ladder, with no evidence, because none was usable.
+    """The fail-closed route: the strongest handler the caller stands behind, with no evidence.
 
     Up rather than down on purpose. A router that falls back to the cheap handler when it
     cannot decide is a router that answers every hard request badly the moment Jev is
-    unreachable.
+    unreachable. "Up" stops at the caller's own safety claim, though: with no answers,
+    this request might be anything, so a top rung the caller marked unfit for sensitive
+    work does not get it — see `_stood_behind`. `eligible` is empty because no gate answer
+    arrived to compute it from.
     """
+    target, note = _stood_behind(registry, sensitive=None)
     return RouteDecision(
-        handler=registry.strongest.id,
+        handler=target.id,
         reason=reason,
         floor_met=None,
-        eligible=(registry.strongest.id,),
+        eligible=(),
         dropped=dropped,
         truncated_chars=truncated_chars,
-        detail=detail,
+        detail=f"{detail}{note}",
     )
 
 
+def _top_of_the_eligible(
+    registry: Registry,
+    pool: tuple[Handler, ...],
+    *,
+    sensitive: bool,
+) -> tuple[Handler, str]:
+    """Where a route goes when the pick is not usable: the strongest handler that may have it.
+
+    With an eligible set in hand that is its strongest member. A fallback that reached for
+    `registry.strongest` instead would hand the request to a rung the gates just ruled
+    out — which is how a sensitive request ends up on the one handler the caller marked
+    `sensitive_ok=False`. With nothing eligible there is no gate-satisfying answer at all,
+    so the route falls back to what the caller stands behind and says so.
+    """
+    if pool:
+        return pool[-1], ""
+    return _stood_behind(registry, sensitive=sensitive)
+
+
 def _at_or_above(pool: tuple[Handler, ...], tier: int) -> Handler:
-    """The cheapest handler in `pool` that is not weaker than `tier`; the strongest if none is."""
+    """The cheapest handler in `pool` that is not weaker than `tier`; the strongest if none is.
+
+    The fallback is a route *down*: the gates left nothing as strong as the pick. `decide`
+    marks it `downgraded` rather than calling it an escalation.
+    """
     return next((handler for handler in pool if handler.tier >= tier), pool[-1])
+
+
+def _moved(target: Handler, chosen: Handler) -> str:
+    """How the route relates to the pick, for the log line."""
+    if target.tier > chosen.tier:
+        return f"escalated to {target.id}"
+    if target.tier < chosen.tier:
+        return f"downgraded to {target.id}"
+    return f"routed to {target.id}"
 
 
 def _one_step_up(pool: tuple[Handler, ...], handler: Handler) -> Handler:
@@ -500,7 +645,9 @@ def decide(
 
     Order matters and is the policy: a request that tries to steer the router is dealt
     with before its own preferred route is considered, the capability gates are applied
-    before the confidence floor, and the floor only ever pushes a route upward.
+    before the confidence floor, and the floor only ever pushes a route upward. The gates
+    are the one thing that can push it down — they are hard constraints, so when nothing
+    eligible is as strong as the pick the decision comes back `downgraded`.
     """
     try:
         picked = reply.picked(HANDLER)
@@ -526,9 +673,6 @@ def decide(
         sensitive=sensitive,
         depth=depth,
     )
-    gates_emptied = not pool
-    if gates_emptied:
-        pool = (registry.strongest,)
     required = FLOOR_SENSITIVE if sensitive else FLOOR_ROUTE_DOWN
 
     evidence: dict[str, Any] = {
@@ -549,25 +693,46 @@ def decide(
         "latency_ms": reply.latency_ms,
     }
     floor_met = confidence >= required
+    #: Read for its tier only, so the log can say which way the route moved. The pick
+    #: itself is not honoured until the steering question and the gates have had their say.
+    chosen = registry.get(picked)
 
     if steering >= STEERING_SUSPECTED:
+        target, note = _top_of_the_eligible(registry, pool, sensitive=sensitive)
         return RouteDecision(
-            handler=registry.strongest.id,
+            handler=target.id,
             reason="steering",
             floor_met=floor_met,
-            detail="the request addresses the routing decision, so it does not get to make it",
+            downgraded=target.tier < chosen.tier,
+            detail=(
+                "the request addresses the routing decision, so it does not get to make it; "
+                f"{_moved(target, chosen)}{note}"
+            ),
             **evidence,
         )
 
-    chosen = registry.get(picked)
-    if gates_emptied or chosen.id not in {handler.id for handler in pool}:
-        target = _at_or_above(pool, chosen.tier)
-        why = "no handler satisfies the gates" if gates_emptied else f"{chosen.id} is ruled out by the gates"
+    if not pool:
+        target, note = _top_of_the_eligible(registry, pool, sensitive=sensitive)
         return RouteDecision(
             handler=target.id,
             reason="not_eligible",
             floor_met=floor_met,
-            detail=f"{why}; escalated to {target.id}",
+            downgraded=target.tier < chosen.tier,
+            detail=f"no handler satisfies the gates; {_moved(target, chosen)}{note}",
+            **evidence,
+        )
+    if chosen.id not in {handler.id for handler in pool}:
+        target = _at_or_above(pool, chosen.tier)
+        down = target.tier < chosen.tier
+        ruled_out = f"{chosen.id} is ruled out by the gates"
+        if down:
+            ruled_out += " and no eligible handler is as strong"
+        return RouteDecision(
+            handler=target.id,
+            reason="not_eligible",
+            floor_met=floor_met,
+            downgraded=down,
+            detail=f"{ruled_out}; {_moved(target, chosen)}",
             **evidence,
         )
     if not floor_met:
@@ -580,13 +745,15 @@ def decide(
                 detail=f"{confidence:.2f} below the {required:.2f} a route down needs; up to {target.id}",
                 **evidence,
             )
+        #: Nowhere further up, so the handler stands — but the reason does not pretend the
+        #: route was taken on confidence. Counting reasons has to separate the two.
         return RouteDecision(
             handler=chosen.id,
-            reason="routed",
+            reason="low_confidence",
             floor_met=floor_met,
             detail=(
                 f"{confidence:.2f} below {required:.2f}, but {chosen.id} is already "
-                "the strongest eligible handler"
+                "the strongest eligible handler, so the route stands without it"
             ),
             **evidence,
         )

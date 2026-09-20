@@ -97,6 +97,22 @@ TIER_SCALE: Mapping[str, float] = {READ_ONLY: 1.6, MUTATING: 1.0, PRIVILEGED: 0.
 #: unreachable: even a read-only tool has a probability at which it stops.
 THRESHOLD_CEILING = 0.95
 
+#: The noul that carries no information: "yes and no are equally likely". A noul
+#: has no confidence field, so this value is the only way the model can say it
+#: cannot tell, and it must never be answered with ALLOW.
+UNINFORMATIVE_NOUL = 0.5
+
+#: Ceiling on every *signal* confirm threshold after the tier scale. Without it,
+#: a lenient tier can lift a confirm threshold above `UNINFORMATIVE_NOUL` and a
+#: shrug becomes an ALLOW — which is what `production` on a read-only tool did at
+#: 0.35 x 1.6 = 0.56. Clamping here keeps "a shrug asks a human" true for every
+#: signal and every future tier scale instead of by accident for four of five.
+#: `check_policy` asserts it. The blast radius is deliberately not clamped this
+#: way: it is a position on a five-level scale, where the middle level is an
+#: answer rather than a shrug, and its uncertainty is caught by the confidence
+#: floor below.
+CONFIRM_CEILING = 0.49
+
 DESTRUCTIVE = "destructive"
 IRREVERSIBLE = "irreversible"
 PRODUCTION = "production"
@@ -264,8 +280,9 @@ BLAST_CONFIRM_AT = 0.45
 BLAST_BLOCK_AT = 0.90
 
 #: The only confidence in the request belongs to the two graded questions; a noul
-#: carries none, which is why the noul thresholds above are low enough that an
-#: uninformative 0.5 already fails ALLOW. This floor covers the other half: if
+#: carries none, which is why every signal confirm threshold above is held below
+#: `UNINFORMATIVE_NOUL` by `CONFIRM_CEILING`, so an uninformative 0.5 fails ALLOW
+#: on every signal and every tier. This floor covers the other half: if
 #: the model cannot tell how far the call reaches, the reading it gave is not
 #: something to allow on. Interpolated on the blast radius, not tier-scaled — a
 #: scaled floor above 1.0 would stop every call and hide the policy.
@@ -308,9 +325,17 @@ def scaled(threshold: float, tier: str) -> float:
 
 
 def thresholds_for(signal: str, tier: str) -> tuple[float, float | None]:
-    """(confirm at, block at) for one signal under one tier. `None` never blocks alone."""
+    """(confirm at, block at) for one signal under one tier. `None` never blocks alone.
+
+    The confirm leg is additionally clamped by `CONFIRM_CEILING`, so no tier scale
+    can lift it to or past the uninformative noul: a signal answered 0.5 always
+    reaches at least CONFIRM.
+    """
     confirm_at, block_at = SIGNAL_POLICY[signal]
-    return scaled(confirm_at, tier), None if block_at is None else scaled(block_at, tier)
+    return (
+        min(scaled(confirm_at, tier), CONFIRM_CEILING),
+        None if block_at is None else scaled(block_at, tier),
+    )
 
 
 def blast_thresholds_for(tier: str) -> tuple[float, float]:
@@ -344,6 +369,19 @@ def check_policy() -> list[str]:
             problems.append(f"{signal}: confirm threshold {confirm_at} is not in (0, 1]")
         if block_at is not None and not confirm_at <= block_at <= 1:
             problems.append(f"{signal}: block threshold {block_at} is below its confirm threshold or above 1")
+    if CONFIRM_CEILING >= UNINFORMATIVE_NOUL:
+        problems.append(
+            f"the confirm ceiling {CONFIRM_CEILING} is not below the uninformative noul "
+            f"{UNINFORMATIVE_NOUL}: a shrug could be allowed"
+        )
+    for signal in SIGNAL_POLICY:
+        for tier in TIER_ORDER:
+            confirm_at, _ = thresholds_for(signal, tier)
+            if confirm_at >= UNINFORMATIVE_NOUL:
+                problems.append(
+                    f"{signal} on a {tier} tool confirms only at {confirm_at}, at or above the "
+                    f"uninformative noul {UNINFORMATIVE_NOUL}: a shrug would be allowed"
+                )
     if not BLAST_CONFIRM_AT <= BLAST_BLOCK_AT <= 1:
         problems.append(f"blast radius: {BLAST_CONFIRM_AT} and {BLAST_BLOCK_AT} are out of order")
     for names, threshold, label in COMBINATIONS:
@@ -372,7 +410,8 @@ class ToolCall:
 
     `task` is the operator's instruction. `context` is the text the agent read
     before proposing this — retrieved passages, page content, earlier tool output
-    — and is what the injection question is about. `rationale` is the agent's own
+    — and is what the injection question is about; one passage may be passed as a
+    bare string and counts as one item. `rationale` is the agent's own
     account of itself: a claim, not evidence, and labelled that way in the state.
     `redact` names arguments whose values must not be sent; the gate judges the
     call from the argument's name and shape instead.
@@ -464,10 +503,20 @@ def _trim(text: str, ceiling: int) -> tuple[str, bool]:
 
 
 def _render(value: Any, ceiling: int) -> tuple[Any, bool]:
-    """A value as the state should carry it: structure when it fits, capped text when not."""
+    """A value as the state should carry it: structure when it fits, capped text when not.
+
+    Never raises. `default=str` covers an unserialisable *value*, but not a dict
+    key that is not a scalar, a reference cycle, or nesting past the recursion
+    limit. Any of those would otherwise escape `gate` as an exception from a
+    function documented to return a `Decision`; here the value is reported as
+    withheld instead, which forbids ALLOW.
+    """
     if isinstance(value, str):
         return _trim(value, ceiling)
-    text = json.dumps(value, ensure_ascii=False, default=str)
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError, RecursionError) as error:
+        return f"<{type(value).__name__} the state cannot carry: {type(error).__name__}>", True
     if len(text) <= ceiling:
         return value, False
     return text[:ceiling] + TRIM_MARKER, True
@@ -512,8 +561,13 @@ def describe_call(call: ToolCall, tiers: Mapping[str, str]) -> CallView:
     unmatched = tuple(f"unredacted.{name}" for name in call.redact if name not in call.arguments)
     dropped.extend(unmatched)
 
+    # A bare `str` (or `bytes`) satisfies `Sequence[Any]`, and iterating one would
+    # send the first eight characters as eight separate context items and drop the
+    # rest of the untrusted text. One string is one context item.
+    items = [call.context] if isinstance(call.context, (str, bytes)) else call.context
+
     context: list[Any] = []
-    for position, item in enumerate(call.context):
+    for position, item in enumerate(items):
         label = f"untrusted_context[{position}]"
         if position >= MAX_CONTEXT_ITEMS:
             dropped.append(label)

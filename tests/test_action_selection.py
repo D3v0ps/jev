@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 from typesafe_sdk import ChoiceAnswer, NoulAnswer, ScoreAnswer, SystemOneResponse, Usage
 
-from jevkit import limits
+from jevkit import cost, limits
 from jevkit.answers import Reply
 from jevkit.recipes import action_selection as recipe
 from jevkit.recipes.action_selection import (
@@ -140,6 +141,55 @@ def test_the_caller_handle_never_reaches_the_request(jev):
     assert decision.target.handle == "#go-xpath", "the caller maps the index back to its own handle"
 
 
+#: Two toggles. CHECK and UNCHECK are defined as applying only to a control that
+#: is currently off / on, so the model cannot honour that without `state`.
+TOGGLE_SCREEN = (
+    Candidate(
+        role="checkbox",
+        label="Save this card",
+        state="unchecked",
+        operations=("CHECK",),
+        handle="#save-xpath",
+    ),
+    Candidate(
+        role="switch",
+        label="Email me offers",
+        value="on",
+        state="checked",
+        operations=("UNCHECK",),
+        handle="#news-xpath",
+    ),
+)
+
+CHECK_TARGET = recipe.target_question_id("CHECK")
+
+
+def test_element_state_travels_with_the_element(jev):
+    """`Candidate.state` is what makes CHECK and UNCHECK decidable at all."""
+    client, calls = jev(
+        script(operation_weights(TOGGLE_SCREEN, CHECK=90, WAIT=10), targets={CHECK_TARGET: "e0"})
+    )
+    decision = select_action(client, "save the card for next time", TOGGLE_SCREEN)
+    elements = calls[0].state["observation"]["elements"]
+    assert elements[0] == {
+        "index": 0,
+        "role": "checkbox",
+        "label": "Save this card",
+        "state": "unchecked",
+        "can": ["CHECK"],
+    }
+    assert elements[1]["state"] == "checked", "an element already on must say so"
+    assert elements[1]["value"] == "on"
+    assert decision.action == ACT and decision.target_index == 0
+
+
+def test_an_element_without_state_says_nothing_about_it(jev):
+    client, calls = jev(script("WAIT"))
+    select_action(client, GOAL, SCREEN)
+    for element in calls[0].state["observation"]["elements"]:
+        assert "state" not in element, "an absent state must not be invented as a value"
+
+
 def test_non_actionable_elements_stay_as_context_without_a_head():
     space = build_action_space([*SCREEN, Candidate(role="heading", label="Catalogue")])
     state = build_state(GOAL, space)
@@ -159,7 +209,9 @@ def test_an_unknown_operation_is_an_integration_bug():
     "stakes,expected_action,expected_floor",
     [
         (0, ACT, recipe.FLOOR_AT_NO_STAKES),
-        (1.5, ASK_OPERATOR, 0.735),
+        # A mass-split answer is read off its upper tail, so mass on "Committing"
+        # sets the floor for level 2, not for the mean of 1.5.
+        (1.5, ASK_OPERATOR, recipe.confidence_floor(2 / (len(recipe.STAKES_LEVELS) - 1))),
         (3, ASK_OPERATOR, recipe.FLOOR_AT_FULL_STAKES),
     ],
 )
@@ -181,6 +233,90 @@ def test_the_floor_scales_with_the_stakes(jev, stakes, expected_action, expected
         assert "floor" in decision.reason
 
 
+#: Two clickable elements, one of which moves money. The reviewer's probe.
+TRANSFER_SCREEN = (
+    Candidate(role="button", label="Confirm transfer of 4,200", operations=("CLICK",), handle="#confirm"),
+    Candidate(role="link", label="Back to preview", operations=("CLICK",), handle="#back"),
+)
+
+
+def test_an_undecided_stakes_answer_does_not_buy_a_click(jev):
+    """Half the mass on read-only and half on irreversible must gate as irreversible.
+
+    The mean of that distribution is 0.5, which would set a floor of 0.735 and let
+    a 0.78-confidence click through. Uncertainty about how dangerous the screen is
+    has to resolve upwards, or the safest thing an attacker-reachable screen can
+    do is read as ambiguous rather than as safe.
+    """
+    coin_flip = {"0": 0.5, "1": 0.0, "2": 0.0, "3": 0.5}
+    client, _ = jev(
+        script(
+            operation_weights(TRANSFER_SCREEN, CLICK=78, WAIT=22),
+            targets={CLICK_TARGET: {"e0": 78, "e1": 22}},
+            stakes=coin_flip,
+        )
+    )
+    decision = select_action(client, "transfer 4,200 to the supplier", TRANSFER_SCREEN)
+    assert decision.action == ASK_OPERATOR, "an ambiguous stakes answer must not act"
+    assert decision.target is None and decision.target_index is None
+    assert decision.stakes == pytest.approx(0.5), "the mean is still reported as evidence"
+    assert decision.stakes_gate == pytest.approx(1.0), "the floor comes off the upper tail"
+    assert decision.floor == pytest.approx(recipe.FLOOR_AT_FULL_STAKES)
+    assert decision.confidence == pytest.approx(0.78)
+
+
+@pytest.mark.parametrize("offset,expected_action", [(-0.02, ACT), (+0.02, ASK_OPERATOR)])
+def test_the_floor_follows_the_stakes_tail_mass(jev, offset, expected_action):
+    """Either side of STAKES_TAIL_MASS, with the mean barely moving at all."""
+    irreversible = recipe.STAKES_TAIL_MASS + offset
+    client, _ = jev(
+        script(
+            operation_weights(SCREEN, CLICK=95, WAIT=5),
+            targets={CLICK_TARGET: {"e1": 90, "e2": 10}},
+            stakes={"0": 1 - irreversible, "1": 0.0, "2": 0.0, "3": irreversible},
+        )
+    )
+    decision = select_action(client, GOAL, SCREEN)
+    assert decision.action == expected_action
+    assert decision.confidence == pytest.approx(0.90)
+    assert decision.stakes == pytest.approx(irreversible), "the mean is the same either side"
+    if expected_action == ASK_OPERATOR:
+        assert decision.stakes_gate == pytest.approx(1.0)
+        assert decision.floor == pytest.approx(recipe.FLOOR_AT_FULL_STAKES)
+    else:
+        assert decision.stakes_gate == pytest.approx(irreversible)
+        assert decision.floor < recipe.FLOOR_AT_FULL_STAKES
+
+
+def test_a_middling_stakes_answer_is_still_gated_by_its_mean():
+    """The tail is a floor on the floor, not a replacement for the mean."""
+    spread = {index: 0.25 for index in range(len(recipe.STAKES_LEVELS))}
+    assert recipe.stakes_tail(spread) == pytest.approx(1.0)
+    # Mass only on the two middle levels: no tail at the top, mean still 0.5.
+    middle = {0: 0.0, 1: 0.5, 2: 0.5, 3: 0.0}
+    assert recipe.stakes_tail(middle) == pytest.approx(2 / 3)
+    assert recipe.gating_stakes({0: 0.9, 1: 0.1, 2: 0.0, 3: 0.0}, 0.9) == pytest.approx(0.9)
+
+
+def test_an_unreadable_stakes_legend_gates_at_the_top_floor():
+    """A Score whose levels are not indices cannot be placed: assume the worst."""
+    space = build_action_space(SCREEN)
+    answers = _well_formed_answers()
+    levels = list(recipe.STAKES_LEVELS)
+    legend = {"lo": levels[0], "mid": levels[1], "hi": levels[2], "top": levels[3]}
+    answers[recipe.STAKES_QUESTION_ID] = ScoreAnswer.model_construct(
+        type="score",
+        score=0.0,
+        legend=legend,
+        probabilities=dict.fromkeys(legend, 0.25),
+        confidence=0.9,
+    )
+    decision = decide(_reply(build_questions(space), answers), space)
+    assert decision.stakes_gate == pytest.approx(1.0)
+    assert decision.floor == pytest.approx(recipe.FLOOR_AT_FULL_STAKES)
+    assert decision.action == ASK_OPERATOR
+
+
 @pytest.mark.parametrize(
     "weights,expected_action",
     [({"e1": 70, "e2": 30}, ACT), ({"e1": 56, "e2": 44}, ASK_OPERATOR)],
@@ -193,6 +329,45 @@ def test_two_targets_too_close_together_go_to_a_human(jev, weights, expected_act
     assert decision.confidence is not None and decision.floor is not None
     assert decision.confidence >= decision.floor, "this pair is about the margin, not the floor"
     assert (decision.margin >= recipe.TARGET_MARGIN_MIN) is (expected_action == ACT)
+
+
+def test_a_single_candidate_head_reports_no_margin_at_all(jev):
+    """One option means no runner-up, so there is no lead to report or to gate on.
+
+    Reporting the top probability here would put `margin=1.00` on the decision — a
+    claimed 1.00 lead over an alternative that was never offered — and turn the
+    TARGET_MARGIN_MIN gate into a no-op that reads like it fired.
+    """
+    one_button = (Candidate(role="button", label="Pay now", operations=("CLICK",), handle="#pay"),)
+    client, calls = jev(
+        script(
+            operation_weights(one_button, CLICK=93, WAIT=7),
+            targets={CLICK_TARGET: "e0"},
+            stakes=3,
+        )
+    )
+    decision = select_action(client, "pay the invoice", one_button)
+    assert set(calls[0].questions[CLICK_TARGET]["criteria"]) == {"e0"}
+    assert decision.action == ACT, "the operation head alone gates a head with one candidate"
+    assert decision.margin is None, "a margin of 1.00 over nothing would be a fiction"
+    assert decision.confidence == pytest.approx(0.93)
+    assert decision.floor == pytest.approx(recipe.FLOOR_AT_FULL_STAKES)
+
+
+def test_the_operation_head_still_refuses_a_lone_candidate_below_the_floor(jev):
+    """No margin to gate on does not mean no gate: the floor still applies."""
+    one_button = (Candidate(role="button", label="Pay now", operations=("CLICK",), handle="#pay"),)
+    client, _ = jev(
+        script(
+            operation_weights(one_button, CLICK=80, WAIT=20),
+            targets={CLICK_TARGET: "e0"},
+            stakes=3,
+        )
+    )
+    decision = select_action(client, "pay the invoice", one_button)
+    assert decision.action == ASK_OPERATOR
+    assert decision.margin is None
+    assert "floor" in decision.reason
 
 
 def test_the_operation_head_can_veto_a_confident_target(jev):
@@ -269,7 +444,9 @@ HOSTILE = (
 
 @pytest.mark.parametrize(
     "injection,expected_action",
-    [(0.9, BLOCKED), (0.2, ACT)],
+    # INJECTION_BLOCK itself blocks: the comparison is `>=`, and the boundary is
+    # the number a reader tunes, so it is pinned here rather than approached.
+    [(0.9, BLOCKED), (recipe.INJECTION_BLOCK, BLOCKED), (0.2, ACT)],
 )
 def test_screen_text_that_issues_orders_stops_the_loop(jev, injection, expected_action):
     """A page can say anything; it never becomes an instruction, only evidence."""
@@ -300,12 +477,47 @@ def test_the_state_separates_the_goal_from_the_screen():
 # --- failing closed --------------------------------------------------------
 
 
+def _crowd(count):
+    return tuple(
+        Candidate(role="link", label=f"Result {index}", operations=("CLICK",), handle=f"#r{index}")
+        for index in range(count)
+    )
+
+
 def test_a_failed_request_never_becomes_an_action(jev):
     client, calls = jev([Fail(422, "bad request"), Fail(422, "bad request")])
-    decision = select_action(client, GOAL, SCREEN)
+    crowd = _crowd(recipe.MAX_HEAD_OPTIONS + 45)
+    decision = select_action(client, GOAL, crowd)
     assert decision.action == ASK_OPERATOR
     assert "the request failed" in decision.reason
     assert calls, "the request was attempted"
+    assert decision.dropped == {"CLICK": tuple(range(recipe.MAX_HEAD_OPTIONS, len(crowd)))}, (
+        "a caller whose request failed still has to learn which candidates were unselectable"
+    )
+
+
+def test_a_refused_decision_still_reports_what_was_not_offered(jev):
+    """`dropped` and `trimmed` travel on the failing paths, not only on ACT."""
+    crowd = (
+        Candidate(
+            role="link",
+            label="L" * (recipe.LABEL_CHARS + 20),
+            operations=("CLICK",),
+            handle="#wordy",
+        ),
+        *_crowd(recipe.MAX_HEAD_OPTIONS + 45)[1:],
+    )
+    client, _ = jev(
+        script(
+            operation_weights(crowd, CLICK=60, WAIT=40),
+            targets={CLICK_TARGET: "e0"},
+            stakes=3,
+        )
+    )
+    decision = select_action(client, GOAL, crowd)
+    assert decision.action == ASK_OPERATOR and "floor" in decision.reason
+    assert decision.dropped == {"CLICK": tuple(range(recipe.MAX_HEAD_OPTIONS, len(crowd)))}
+    assert decision.trimmed == (0,)
 
 
 def test_an_oversized_request_is_refused_before_the_network(jev):
@@ -412,6 +624,58 @@ def test_overlong_element_text_is_capped_and_reported(jev):
     assert element["label"].endswith(recipe.TRIM_MARKER)
     assert decision.trimmed == (0,), "a shortened label is reported, never silently capped"
     assert decision.action == ACT
+    assert decision.margin is None, "the type-text head offered one element, so there is no lead"
+
+
+#: The screens docs/action_selection.md tabulates, and the goal it prices them with.
+DOC = pathlib.Path(__file__).resolve().parent.parent / "docs" / "action_selection.md"
+DOC_GOAL = "buy the red mug"
+DOC_ROWS = (
+    (12, ("CLICK",)),
+    (40, ("CLICK",)),
+    (40, ("CLICK", "HOVER", "SCROLL_TO")),
+    (120, ("CLICK",)),
+    (255, ("CLICK",)),
+)
+
+
+def _doc_screen(count, operations):
+    return tuple(
+        Candidate(role="link", label=f"Result {index}", operations=operations, handle=f"#r{index}")
+        for index in range(count)
+    )
+
+
+def test_the_doc_cost_numbers_come_from_this_code():
+    """Every token count and dollar figure in the doc is recomputed here.
+
+    The cost table is the one place the doc demonstrates the measure-don't-assert
+    rule, so it must not be able to drift from the request the recipe builds — a
+    reworded question moves the counts, and this fails until the table is redone.
+    """
+    doc = DOC.read_text(encoding="utf-8")
+    for count, operations in DOC_ROWS:
+        space = build_action_space(_doc_screen(count, operations))
+        questions = build_questions(space)
+        tokens = limits.check_request(build_state(DOC_GOAL, space), questions)
+        usd = cost.usd_for(FAKE_MODEL, tokens)
+        row = f"| {len(space.heads)} | {len(questions)} | {tokens:,} | ${usd:.8f} | ${usd * 10_000:.2f} |"
+        assert row in doc, f"{count} elements, {operations}: the doc's table row is not {row}"
+        printed = f"{tokens} tokens, ${usd:.8f}, ${usd * 10_000:.2f}/10k"
+        assert printed in doc, f"the doc's pasted snippet output is not {printed}"
+
+
+def test_the_doc_token_breakdown_adds_up():
+    doc = DOC.read_text(encoding="utf-8")
+    space = build_action_space(_doc_screen(40, ("CLICK", "HOVER")))
+    questions = build_questions(space)
+    state = build_state(DOC_GOAL, space)
+    total = limits.check_request(state, questions)
+    parts = [limits.estimate_tokens(state), *(limits.estimate_tokens(q) for q in questions.values())]
+    assert sum(parts) == total, "the breakdown must account for the whole request"
+    assert f"({total:,} tokens total)" in doc
+    for part in parts:
+        assert f"| {part} |" in doc, f"no breakdown row reports {part} tokens"
 
 
 def test_the_stakes_rubric_fits_the_score_limits():

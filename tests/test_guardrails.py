@@ -599,6 +599,33 @@ def test_the_policy_table_is_internally_consistent():
     assert recipe.check_policy() == []
 
 
+def test_check_policy_catches_a_harm_pair_whose_verdicts_run_backwards(monkeypatch):
+    """`decide` takes the first matching row and stops, so the rows must weaken downward.
+
+    With the verdict column swapped, harm 0.80 alongside a signal at 0.30 matched
+    the first row and yielded REVIEW, while harm 0.60 with the same signal fell
+    through to the second and yielded BLOCK - less harm stopping more. check_policy
+    passed that table.
+    """
+    backwards = ((0.75, 0.30, REVIEW, "weaker first"), (0.50, 0.20, BLOCK, "stronger second"))
+    monkeypatch.setattr(recipe, "HARM_PAIRS", backwards)
+    problems = recipe.check_policy()
+    assert any("stronger than" in problem for problem in problems), problems
+
+
+def test_check_policy_still_reads_the_flag_thresholds_as_written(monkeypatch):
+    """The clamp guarantees the behaviour; the invariant is still a claim about the table.
+
+    Otherwise `effective_flag` would silently satisfy the check for a reviewer who
+    wrote a threshold above an uninformative noul.
+    """
+    loose = dict(recipe.HAZARD_POLICY)
+    loose[recipe.VIOLENCE] = (recipe.SERIOUS, 0.60, 0.70)
+    monkeypatch.setattr(recipe, "HAZARD_POLICY", loose)
+    problems = recipe.check_policy()
+    assert any("uninformative" in problem for problem in problems), problems
+
+
 def test_a_verdict_only_ever_rises():
     assert stronger(PASS, FLAG) == FLAG
     assert stronger(BLOCK, FLAG) == BLOCK
@@ -621,6 +648,55 @@ def test_an_uninformative_answer_on_one_signal_already_fails_pass(jev, signal, d
     decision, _ = run(jev, direction=direction, signals={signal: 0.5})
     assert decision.verdict != PASS, f"{signal}/{direction} clears on an uninformative answer"
     assert signal in decision.flagged
+
+
+#: A caller hazard whose own flag threshold is defensible and which the most
+#: lenient direction scale nonetheless pushes past UNINFORMATIVE_NOUL:
+#: 0.40 * 1.35 = 0.54.
+WIDE_FLAG = Hazard(
+    id="brand_risk",
+    question=A_NOUL,
+    label="brand risk",
+    severity=recipe.SERIOUS,
+    flag_at=0.40,
+    block_at=0.80,
+)
+
+
+@pytest.mark.parametrize("direction", recipe.DIRECTIONS)
+def test_a_caller_hazard_cannot_clear_an_uninformative_answer_either(jev, direction):
+    """The invariant is enforced where the threshold is read, not only over the fixed tables.
+
+    `check_policy` covers the rows written in this module; a `Hazard` the caller
+    built goes through no table at all, and the direction scale multiplies its
+    thresholds. brand_risk at 0.40 scaled by 1.35 on retrieved text used to read
+    0.54, so a wholly uninformative 0.50 reading cleared: verdict PASS, flagged
+    empty, crosses True.
+    """
+    flag_at, _, _ = thresholds_for(WIDE_FLAG.id, direction, {WIDE_FLAG.id: WIDE_FLAG})
+    assert flag_at <= recipe.UNINFORMATIVE_NOUL, "a threshold read above 0.50 clears a coin flip"
+
+    decision, _ = run(
+        jev, direction=direction, hazards=[WIDE_FLAG], signals={WIDE_FLAG.id: recipe.UNINFORMATIVE_NOUL}
+    )
+    assert decision.verdict != PASS, f"brand_risk/{direction} clears on an uninformative answer"
+    assert WIDE_FLAG.id in decision.flagged
+    assert decision.thresholds[WIDE_FLAG.id][0] == pytest.approx(flag_at), (
+        "the reported threshold must be the one that actually fired"
+    )
+
+
+def test_clamping_a_flag_threshold_never_raises_one(jev):
+    """`effective_flag` only ever lowers: a threshold at or below 0.50 is untouched."""
+    for raw in (0.0, 0.05, recipe.UNINFORMATIVE_NOUL, 0.9, 1.0):
+        assert recipe.effective_flag(raw) == min(raw, recipe.UNINFORMATIVE_NOUL)
+    quiet, _ = run(
+        jev,
+        direction=RETRIEVED,
+        hazards=[WIDE_FLAG],
+        signals={WIDE_FLAG.id: recipe.UNINFORMATIVE_NOUL - STEP},
+    )
+    assert quiet.verdict == PASS, "a reading below the clamped threshold still passes"
 
 
 def test_the_audit_entry_is_json_and_explains_the_verdict(jev):
@@ -723,6 +799,33 @@ def test_observed_pairs_each_decision_with_its_label(jev):
     assert [p.positive for p in pairs] == [True, False]
     assert {p.direction for p in pairs} == {INBOUND}
     assert threshold_report(pairs, 0.5).caught == 1
+
+
+def test_observed_reads_the_harm_score_as_well_as_the_nouls(jev):
+    """HARM_ALONE_REVIEW_AT and the harm column of HARM_PAIRS are thresholds too.
+
+    The harm reading never lands in `Decision.signals`, so asking `observed` for it
+    used to raise 'carries no probability' on every decision, and the two harm
+    thresholds in the review block could not be swept with the shipped tooling.
+    """
+    levels = len(recipe.HARM_LEVELS) - 1
+    severe, _ = run(jev, harm=0.8 * levels)
+    mild, _ = run(jev, harm=0.2 * levels)
+    assert recipe.HARM_QUESTION_ID not in severe.signals
+
+    pairs = observed([severe, mild], [True, False], recipe.HARM_QUESTION_ID)
+    assert [p.probability for p in pairs] == [pytest.approx(0.8), pytest.approx(0.2)]
+    assert [p.positive for p in pairs] == [True, False]
+    report = threshold_report(pairs, recipe.HARM_ALONE_REVIEW_AT)
+    assert (report.caught, report.false_alarms, report.missed) == (1, 0, 0)
+
+
+def test_observed_still_refuses_a_failed_screening_when_asked_for_harm(jev):
+    client, _ = jev([Fail(500)] * 6)
+    failed = screen(client, BENIGN, direction=INBOUND)
+    assert failed.harm is None
+    with pytest.raises(ValueError, match="carries no probability"):
+        observed([failed], [True], recipe.HARM_QUESTION_ID)
 
 
 def test_observed_refuses_to_guess_at_an_alignment(jev):

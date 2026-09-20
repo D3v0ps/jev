@@ -11,7 +11,8 @@ as prose the loop has to interpret, and interpreting its own supervisor is how a
 ends up both slow and wrong. Whether a check fits inside a given per-step budget is a
 measurement rather than a property of the pattern: `measure()` and
 `Watch.within_budget()` are the instrument, `CHECK_BUDGET_MS` is the hypothesis they
-test against an account, and no number in this file was written by hand.
+test against an account, and no latency number in this file was measured. The thresholds
+are choices, all of them stated in the review block for a reviewer to argue with.
 
 Four properties matter more here than the latency:
 
@@ -118,8 +119,9 @@ DONE_CONFIDENCE = 0.85
 #: person's attention, while declaring it finished ships something that is not there.
 #: Below this bar a blocked claim degrades to STUCK, the verdict a nudge can still fix.
 BLOCKED_CONFIDENCE = 0.70
-#: Probability below which the last step is treated as having made no progress. A noul is
-#: a probability, not a magnitude: 0.35 means "more likely than not that nothing moved".
+#: Probability at or below which the last step is treated as having made no progress (the
+#: comparison in `decide` is `<=`). A noul is a probability, not a magnitude: 0.35 means
+#: "more likely than not that nothing moved".
 PROGRESS_FLOOR = 0.35
 #: Probability at or above which the model's read of "the agent is repeating itself"
 #: counts toward a stall, alongside the deterministic counter below.
@@ -142,11 +144,17 @@ REPEAT_ESCALATE_AT = 4
 #: How many recent steps the repetition detector looks at. Wide enough to catch an
 #: a-b-a-b cycle, short enough that old work does not read as a repeat.
 REPEAT_WINDOW = 6
-#: Similarity at or above which two actions count as the same action. 0.90 catches a
-#: retry with a changed timestamp or page number; lower starts merging real alternatives.
+#: Similarity at or above which two actions count as the same action. It is a ratio of the
+#: whole record, so what it catches depends on the record's length: a retry that changes one
+#: token inside a realistic log line clears it ('GET /orders?page=1 retry' against page=2
+#: measures 0.958), while the same edit to a very short record does not ('page=1' against
+#: 'page=2' measures 0.833). Lower starts merging real alternatives. Records shorter than
+#: roughly twenty characters are effectively compared for equality.
 NEAR_IDENTICAL_RATIO = 0.90
 #: Recent steps sent as state, and the character cap per step and on `observed`. Both are
 #: reported in the Decision when they bite (`dropped_steps`, `truncated`), never silent.
+#: `ENTRY_CHARS` also caps what the repetition detector compares, so it compares the text
+#: the model is given and its own cost stays bounded by the same number.
 HISTORY_WINDOW = 8
 ENTRY_CHARS = 600
 CUT_MARK = " …[cut]"
@@ -379,6 +387,10 @@ class Decision:
     line says so. The evidence fields are None on the paths where no usable answer
     arrived, and the code-owned fields (`repeats`, `steps`, `budget_used`) are always
     filled, because code can always count them.
+
+    `latency_ms` is the whole check — the local work in `repeats_in` and `prepare` as well
+    as the request — because the supervisor's cost to a loop step is all of it, not just
+    the network. `jev.ledger` keeps the request-only number when you want to separate them.
     """
 
     action: Action
@@ -421,6 +433,8 @@ class Decision:
             parts.append(f"goal_met {self.goal_met:.2f}")
         if self.progress is not None:
             parts.append(f"progress {self.progress:.2f}")
+        if self.repeating is not None:
+            parts.append(f"repeating {self.repeating:.2f}")
         if self.remaining is not None:
             parts.append(f"remaining {self.remaining:.2f}")
         if self.steering is not None:
@@ -449,13 +463,18 @@ class Prepared:
     truncated: tuple[str, ...]
 
 
-def _text(value: Any) -> str:
-    """A comparable, whitespace-normalised rendering of a step record."""
+def _text(value: Any, *, limit: int = ENTRY_CHARS) -> str:
+    """A comparable, whitespace-normalised rendering of a step record, capped at `limit`.
+
+    The cap is `ENTRY_CHARS`, the same one `prepare` applies before sending a step, so the
+    comparison sees what the model sees and the quadratic part of `SequenceMatcher` cannot
+    be handed a megabyte of tool output by a caller whose log records are unbounded.
+    """
     if isinstance(value, str):
         text = value
     else:
         text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-    return " ".join(text.lower().split())
+    return " ".join(text.lower().split())[:limit]
 
 
 def _near_identical(left: str, right: str) -> bool:
@@ -472,7 +491,12 @@ def repeats_in(history: Sequence[Any], *, window: int = REPEAT_WINDOW) -> int:
     Counts matches anywhere in the last `window` steps rather than only consecutive ones,
     so an a-b-a-b cycle is caught as well as a-a-a. Near-identical counts: two records
     whose text is `NEAR_IDENTICAL_RATIO` similar are the same action with a different
-    timestamp, page number or attempt counter.
+    timestamp, page number or attempt counter. Each record is compared on its first
+    `ENTRY_CHARS` characters, the cap `prepare` sends, so two steps that agree that far are
+    a repeat to this counter exactly as they are to the model.
+
+    Raises whatever `json.dumps` raises on a record it cannot serialise; the entry points
+    call it inside their own try, so a caller never sees that instead of a Decision.
     """
     if window < 1:
         raise ValueError("window must be at least 1")
@@ -660,8 +684,10 @@ def decide(
     The order of the gates is the policy. Steering first, because untrusted text that
     talks about stopping poisons every other answer. The done branch next, before the
     budget, so a run that finishes on its last allowed step is DONE rather than an
-    escalation. Then the counters code owns, then the model's stall verdicts, and
-    CONTINUE only when nothing else fired.
+    escalation — but only a *verified* DONE outranks the counters; an unverified one falls
+    through to them, because a claim nothing independent confirmed cannot end a run that
+    code has already called over. Then the counters code owns, then the model's stall
+    verdicts, and CONTINUE only when nothing else fired.
     """
     spent = check_in.budget.used(steps=check_in.step, elapsed_s=check_in.elapsed_s)
     counted: dict[str, Any] = {
@@ -714,9 +740,18 @@ def decide(
             ),
             **evidence,
         )
+    exhausted = check_in.budget.exhausted(steps=check_in.step, elapsed_s=check_in.elapsed_s)
+    escalating_repeats = repeats >= REPEAT_ESCALATE_AT
     if verdict == DONE:
-        return _resolve_done(evidence, verify=verify, allow_unverified_done=allow_unverified_done)
-    if check_in.budget.exhausted(steps=check_in.step, elapsed_s=check_in.elapsed_s):
+        resolved = _resolve_done(evidence, verify=verify, allow_unverified_done=allow_unverified_done)
+        # A *verified* DONE beats the counters: a run that finishes on its last allowed
+        # step has finished, and the caller's own check looked at the world to say so. An
+        # unverified one does not: nothing independent confirmed it, so it cannot be the
+        # thing that ends a run already past a ceiling code owns. Falling through hands
+        # the overrun or the repeat loop to a person with the done claim in the evidence.
+        if not ((exhausted or escalating_repeats) and resolved.unverified_done):
+            return resolved
+    if exhausted:
         return Decision(
             action=NEEDS_HUMAN,
             reason="budget_exhausted",
@@ -726,7 +761,7 @@ def decide(
             ),
             **evidence,
         )
-    if repeats >= REPEAT_ESCALATE_AT:
+    if escalating_repeats:
         return Decision(
             action=NEEDS_HUMAN,
             reason="repeating",
@@ -808,10 +843,14 @@ def check_step(
     DONE is marked unverified.
     """
     started = time.perf_counter()
-    repeats = repeats_in(check_in.history)
+    repeats = 0
     dropped_steps = 0
     truncated: tuple[str, ...] = ()
     try:
+        # Inside the try: a step record a real agent log can hold — mixed-type dict keys,
+        # a self-referential object — makes json.dumps raise, and the supervisor must fail
+        # to NEEDS_HUMAN like any other broken signal rather than kill the loop.
+        repeats = repeats_in(check_in.history)
         request = prepare(check_in)
         dropped_steps, truncated = request.dropped_steps, request.truncated
         reply = jev.ask(request.state, request.questions, model=model)
@@ -841,7 +880,7 @@ def check_step(
         reply,
         check_in,
         repeats=repeats,
-        latency_ms=reply.latency_ms,
+        latency_ms=_elapsed_ms(started),
         verify=verify,
         allow_unverified_done=allow_unverified_done,
         dropped_steps=dropped_steps,
@@ -859,10 +898,14 @@ async def check_step_async(
 ) -> Decision:
     """`check_step` for an `AsyncJev`, for a loop that cannot block on I/O."""
     started = time.perf_counter()
-    repeats = repeats_in(check_in.history)
+    repeats = 0
     dropped_steps = 0
     truncated: tuple[str, ...] = ()
     try:
+        # Inside the try: a step record a real agent log can hold — mixed-type dict keys,
+        # a self-referential object — makes json.dumps raise, and the supervisor must fail
+        # to NEEDS_HUMAN like any other broken signal rather than kill the loop.
+        repeats = repeats_in(check_in.history)
         request = prepare(check_in)
         dropped_steps, truncated = request.dropped_steps, request.truncated
         reply = await jev.ask(request.state, request.questions, model=model)
@@ -890,7 +933,7 @@ async def check_step_async(
         reply,
         check_in,
         repeats=repeats,
-        latency_ms=reply.latency_ms,
+        latency_ms=_elapsed_ms(started),
         verify=verify,
         allow_unverified_done=allow_unverified_done,
         dropped_steps=dropped_steps,
@@ -903,7 +946,9 @@ class Watch:
     """What a series of check-ins actually took and cost. Every number is measured.
 
     `usd` is None when any reply came from a model with no price in `jevkit.cost`, so a
-    missing price never turns into a wrong number.
+    missing price never turns into a wrong number. `latencies_ms` is one sample per
+    check-in, each covering the whole check, so the percentiles below measure the
+    supervisor rather than the request inside it.
     """
 
     checks: int
@@ -947,11 +992,15 @@ class Watch:
     def within_budget(self, budget_ms: float = CHECK_BUDGET_MS) -> bool:
         """Did every-but-the-worst check land inside `budget_ms`? The hypothesis, measured.
 
-        p95, not the mean: a loop is held up by its slow steps. False when no answer
-        landed at all, because an unmeasured budget is not a met one.
+        p95, not the mean: a loop is held up by its slow steps.
+
+        False when no request ever completed. A check that failed before the network is a
+        real latency sample - the loop waited for it - but it is not evidence that a Jev
+        round trip fits the budget, and a run of 401s would otherwise report the
+        sub-second hypothesis as holding on the strength of failures alone.
         """
         p95 = self.p95_ms
-        return p95 is not None and p95 <= budget_ms
+        return p95 is not None and self.calls > 0 and p95 <= budget_ms
 
     def summary(self) -> str:
         """One line for a demo or a log."""
@@ -960,6 +1009,8 @@ class Watch:
         latency = "no answers landed"
         if self.p50_ms is not None:
             latency = f"p50 {self.p50_ms:.0f} ms · p95 {self.p95_ms:.0f} ms"
+            if not self.calls:
+                latency += " (no request completed, so the budget is unanswered)"
         money = "unpriced" if self.usd is None else f"${self.usd:.6f}"
         per_thousand = self.usd_per_thousand_checks
         rate = "" if per_thousand is None else f" (${per_thousand:.4f}/1k checks)"
@@ -986,7 +1037,9 @@ def measure(
     This is the instrument behind `CHECK_BUDGET_MS`: it measures the supervisor, not the
     agent. `stop_early` leaves the loop at the first decision that is not CONTINUE, which
     is what a real loop does; pass False to score a fixed script of steps end to end. The
-    numbers are deltas over this call only, taken from the client's ledger.
+    token and dollar figures are ledger deltas over this call only; the latencies are each
+    check's own end-to-end time, so `within_budget()` is answered about the supervisor and
+    not about the request inside it.
     """
     ledger = jev.ledger
     before = _snapshot(ledger)
@@ -1015,7 +1068,9 @@ def measure(
         calls=after["calls"] - before["calls"],
         input_tokens=after["input_tokens"] - before["input_tokens"],
         usd=None if unpriced else after["usd"] - before["usd"],
-        latencies_ms=tuple(ledger.latencies_ms[before["samples"] :]),
+        # Per check, not per request: a check that never reached the network still cost the
+        # loop its time, and the local work is this recipe's own to answer for.
+        latencies_ms=tuple(decision.latency_ms for decision in decisions),
     )
 
 
@@ -1029,5 +1084,4 @@ def _snapshot(ledger: Any) -> dict[str, Any]:
         "input_tokens": ledger.input_tokens,
         "usd": ledger.usd,
         "unpriced": ledger.unpriced,
-        "samples": len(ledger.latencies_ms),
     }

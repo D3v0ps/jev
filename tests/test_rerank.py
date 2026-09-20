@@ -7,6 +7,8 @@ no test needs a key.
 from __future__ import annotations
 
 import dataclasses
+import importlib.util
+import pathlib
 
 import pytest
 from typesafe_sdk import NoulAnswer, ScoreAnswer
@@ -16,14 +18,19 @@ from jevkit.errors import QuestionShapeError, RequestTooLarge
 from jevkit.ledger import Ledger
 from jevkit.recipes import rerank as R
 from jevkit.recipes.rerank import (
+    BATCH_STATE_TOKENS,
+    BATCH_TOTAL_TOKENS,
     CONTRADICTS_FLAG,
     DROP_BEYOND_MAX_KEPT,
     DROP_IRRELEVANT,
     DROP_POISONED,
     DROP_UNSCREENED,
+    FAN_OUT_CONCURRENCY,
     FLAG_CLIPPED,
+    FLAG_CONTRADICTION_UNSCREENED,
     FLAG_CONTRADICTS,
     FLAG_LOW_CONFIDENCE,
+    FLAG_SOURCE_CLIPPED,
     FLAG_UNJUDGED,
     KEEP_UNIT_MIN,
     MAX_CANDIDATES_PER_BATCH,
@@ -31,7 +38,10 @@ from jevkit.recipes.rerank import (
     MODE_BATCHED,
     MODE_PER_PAIR,
     OVERFLOW_SHARD,
+    PASSAGE_CHARS_BUDGET,
     POISON_DROP,
+    SOURCE_CHARS_BUDGET,
+    STATE_TOKEN_RESERVE,
     Candidate,
     Case,
     contradicts_id,
@@ -46,6 +56,8 @@ from jevkit.recipes.rerank import (
     rerank_async,
 )
 from jevkit.testing import Fail
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 QUERY = "How many days do I have to ask for a refund?"
 
@@ -144,6 +156,22 @@ def broken_noul(reply, qid):
 # --- one request per decision ------------------------------------------------
 
 
+def test_a_per_pair_run_sends_one_request_per_candidate_in_order(jev):
+    """The doc's "32 candidates is 32 serial round trips" at 32, not extrapolated from 4.
+
+    The four-candidate test pins the shape; this one pins the count the doc actually quotes,
+    because "one request per candidate" is the claim a reader prices their run against.
+    """
+    candidates = [Candidate(f"row{index}", f"passage {index} about refunds") for index in range(32)]
+    labels = [f"c{index}" for index in range(32)]
+    client, calls = jev(asked_only(answers(labels=labels)))
+    decision = rerank(client, QUERY, candidates, mode=MODE_PER_PAIR)
+
+    assert len(calls) == decision.requests == 32
+    assert [list(call.state["candidates"]) for call in calls] == [[label] for label in labels]
+    assert len(decision.order) == 32, "every candidate was judged by its own request"
+
+
 def test_a_batched_rerank_is_one_request(jev):
     client, calls = jev(answers())
     decision = rerank(client, QUERY, CANDIDATES)
@@ -158,16 +186,37 @@ def test_a_batched_rerank_is_one_request(jev):
     assert decision.screened is True
 
 
-def test_the_state_carries_no_caller_id_no_payload_and_no_retriever_rank(jev):
-    client, calls = jev(answers())
-    rerank(client, QUERY, CANDIDATES)
-    body = calls[0].body
-    for candidate in CANDIDATES:
-        assert candidate.id not in repr(body), "a caller id must never reach the request"
-    assert "row" not in repr(body), "the caller's payload must never reach the request"
-    for view in calls[0].state["candidates"].values():
-        assert set(view) <= {"text", "source", "clipped_chars"}
-        assert "rank" not in view, "the retriever's rank is the tie-break in code, not in the state"
+@pytest.mark.parametrize("mode", [MODE_BATCHED, MODE_PER_PAIR])
+def test_the_state_carries_no_caller_id_no_payload_and_no_retriever_rank(mode):
+    """In *either* mode, and in the `window` as well as the candidate views.
+
+    Per-pair mode is the case that went wrong: one candidate per request, so any
+    integer describing "which request is this" is that candidate's retriever rank,
+    stated outright rather than merely inferable from the `c0..cN` label naming.
+    """
+    prepared = plan(QUERY, CANDIDATES, mode=mode)
+    for shard in prepared.shards:
+        sent = repr((shard.state, {qid: q.model_dump() for qid, q in shard.questions.items()}))
+        assert "row" not in sent, "the caller's payload must never reach the request"
+        for candidate in CANDIDATES:
+            assert candidate.id not in sent, "a caller id must never reach the request"
+        for view in shard.state["candidates"].values():
+            assert set(view) <= {"text", "source", "clipped_chars", "source_clipped_chars"}
+            assert "rank" not in view, "the rank is the tie-break in code, not in the state"
+    if mode == MODE_PER_PAIR:
+        windows = [shard.state["window"] for shard in prepared.shards]
+        for window in windows:
+            assert "shard" not in window and "shards" not in window, (
+                "a per-pair request is not a shard of anything, and its index would be the rank"
+            )
+        assert all(window == windows[0] for window in windows), (
+            "every per-pair window must be identical, or it says which pick this candidate was"
+        )
+        assert windows[0] == {
+            "mode": MODE_PER_PAIR,
+            "candidates_here": 1,
+            "candidates_total": len(CANDIDATES),
+        }
 
 
 async def test_per_pair_mode_sends_exactly_one_request_per_candidate(async_jev):
@@ -179,6 +228,43 @@ async def test_per_pair_mode_sends_exactly_one_request_per_candidate(async_jev):
         assert len(call.state["candidates"]) == 1, "a pair request holds its own candidate alone"
         assert len(call.ids()) == 3
     assert sorted(decision.order) == sorted(candidate.id for candidate in CANDIDATES)
+    await client.aclose()
+
+
+def test_the_sync_entry_point_sends_a_per_pair_fan_out_serially(jev):
+    """What `rerank` actually does with per-pair mode, which the docs used to promise was
+    concurrent: N blocking round trips, in plan order, on one client.
+
+    The concurrency lives in `rerank_async`. This test pins the sync shape so the docstring
+    and `docs/rerank.md` cannot drift back into promising a fan-out this path cannot run.
+    """
+    client, calls = jev(asked_only(answers()))
+    decision = rerank(client, QUERY, CANDIDATES, mode=MODE_PER_PAIR)
+    assert len(calls) == len(CANDIDATES)
+    assert decision.requests == len(CANDIDATES)
+    assert [list(call.state["candidates"]) for call in calls] == [[label] for label in LABELS], (
+        "one candidate per request, in the retriever's order, one after the other"
+    )
+    assert decision.latencies_ms and len(decision.latencies_ms) == len(CANDIDATES)
+    assert decision.latency_ms == pytest.approx(sum(decision.latencies_ms)), (
+        "serial requests add up; a concurrent fan-out would wait for the slowest instead"
+    )
+
+
+async def test_the_fan_out_caps_what_is_in_flight_at_the_documented_concurrency(async_jev):
+    """FAN_OUT_CONCURRENCY is what `rerank_async` hands `AsyncJev.map`, unless the caller says."""
+    client, _ = async_jev(asked_only(answers()))
+    seen: list[int] = []
+    real_map = client.map
+
+    async def spy(requests, *, concurrency, model=None):
+        seen.append(concurrency)
+        return await real_map(requests, concurrency=concurrency, model=model)
+
+    client.map = spy
+    await rerank_async(client, QUERY, CANDIDATES, mode=MODE_PER_PAIR)
+    await rerank_async(client, QUERY, CANDIDATES, mode=MODE_PER_PAIR, concurrency=2)
+    assert seen == [FAN_OUT_CONCURRENCY, 2]
     await client.aclose()
 
 
@@ -356,6 +442,43 @@ def test_a_malformed_relevance_answer_keeps_the_candidate_and_flags_it(jev):
     assert record.ranking_unit == R.UNJUDGED_UNIT
 
 
+@pytest.mark.parametrize("how", ["missing", "malformed"], ids=["missing", "malformed"])
+def test_an_unusable_contradiction_answer_is_named_and_costs_the_screened_claim(jev, how):
+    """A contradiction is never a drop — but "nobody looked" must not read as "nothing found".
+
+    `contradicting` is empty either way. The only thing that separates a clean pass from an
+    unanswered premise question is `contradiction_unscreened`, so it is a field of its own and
+    it takes `screened` down with it.
+    """
+    prepared = plan(QUERY, CANDIDATES)
+    state, questions = prepared.requests[0]
+    if how == "missing":
+        asked = {qid: q for qid, q in questions.items() if qid != contradicts_id("c3")}
+        client, _ = jev(asked_only(answers()))
+        reply = client.ask(state, asked)
+    else:
+        client, _ = jev(answers())
+        reply = broken_noul(client.ask(state, questions), contradicts_id("c3"))
+    decision = decide([reply], prepared)
+    record = decision.judged["doc-4"]
+    assert record.contradicts is None
+    assert record.kept is True, "an unanswered premise question is never a reason to drop"
+    assert FLAG_CONTRADICTION_UNSCREENED in record.reasons
+    assert decision.contradiction_unscreened == ("doc-4",)
+    assert decision.contradicting == ()
+    assert decision.screened is False, "an unchecked premise is not a fully screened ranking"
+    assert "unchecked for contradiction" in decision.line()
+
+
+def test_a_full_set_of_answers_leaves_nothing_unscreened(jev):
+    """The other side of the same branch: all three answers present, so no flag and screened."""
+    client, _ = jev(answers())
+    decision = rerank(client, QUERY, CANDIDATES)
+    assert decision.contradiction_unscreened == ()
+    assert decision.screened is True
+    assert all(record.contradicts is not None for record in decision.judged.values())
+
+
 def test_a_failed_request_screens_nothing_and_ranks_nothing(jev):
     client, calls = jev([Fail(422, "malformed request")])
     decision = rerank(client, QUERY, CANDIDATES)
@@ -367,13 +490,29 @@ def test_a_failed_request_screens_nothing_and_ranks_nothing(jev):
     assert "422" in decision.detail or "malformed" in decision.detail
 
 
-async def test_a_failed_fan_out_screens_nothing(async_jev):
-    client, _ = async_jev([{}, Fail(422), {}, {}])
+async def test_a_failed_fan_out_screens_nothing_and_still_reports_what_it_spent(async_jev):
+    """Every request in an all-or-nothing fan-out was dispatched, and the ones that answered
+    were billed. `requests` counts attempts, so the Decision cannot hide the spend."""
+    client, calls = async_jev([{}, Fail(422), {}, {}])
     decision = await rerank_async(client, QUERY, CANDIDATES, mode=MODE_PER_PAIR)
     assert decision.reason == "failed"
     assert decision.order == ()
     assert decision.unscreened == tuple(candidate.id for candidate in CANDIDATES)
+    assert len(calls) == len(CANDIDATES), "the whole fan-out was dispatched"
+    assert decision.requests == len(CANDIDATES), "a reported 0 would hide four billed requests"
+    assert client.ledger.calls == len(CANDIDATES) - 1, "the failure itself returned no usage"
     await client.aclose()
+
+
+def test_a_failure_part_way_through_a_serial_run_counts_the_attempt_that_failed(jev):
+    """Two shards, the second fails: the failed request was sent, and may have been retried."""
+    candidates = short(MAX_CANDIDATES_PER_BATCH + 3)
+    client, calls = jev([{}, Fail(422, "malformed request")])
+    decision = rerank(client, QUERY, candidates, overflow=OVERFLOW_SHARD)
+    assert decision.reason == "failed"
+    assert len(calls) == 2
+    assert decision.requests == 2, "the attempt that failed was still sent"
+    assert client.ledger.calls == 1
 
 
 def test_an_empty_candidate_list_asks_nothing(jev):
@@ -385,6 +524,20 @@ def test_an_empty_candidate_list_asks_nothing(jev):
 
 
 # --- the limits this recipe enforces ----------------------------------------
+
+
+def test_exactly_the_batch_ceiling_is_one_request(jev):
+    """The accepting side of MAX_CANDIDATES_PER_BATCH, which only had its refusing side."""
+    candidates = short(MAX_CANDIDATES_PER_BATCH)
+    prepared = plan(QUERY, candidates)
+    assert len(prepared.shards) == 1
+    assert prepared.shards[0].labels == prepared.labels
+    assert "shard" not in prepared.shards[0].state["window"], "one shard is not a sharded set"
+    client, calls = jev(asked_only(answers(labels=list(prepared.labels))))
+    decision = rerank(client, QUERY, candidates)
+    assert len(calls) == 1
+    assert decision.requests == 1
+    assert len(decision.order) == len(candidates)
 
 
 def test_an_oversized_batch_is_refused_rather_than_truncated(jev):
@@ -400,18 +553,82 @@ def test_an_oversized_batch_is_refused_rather_than_truncated(jev):
 
 
 def test_sharding_judges_every_candidate_and_sends_one_request_per_shard(jev):
+    """Every answer is scripted, so the kept count depends on this module's routing.
+
+    Leaving the answers to the harness's defaults made the "nothing was lost" assertion
+    depend on the default noul (0.5) sitting under POISON_DROP: move the threshold and the
+    test failed for a reason that had nothing to do with sharding.
+    """
     candidates = short(MAX_CANDIDATES_PER_BATCH + 3)
     prepared = plan(QUERY, candidates, overflow=OVERFLOW_SHARD)
+    labels = list(prepared.labels)
     assert [len(shard.labels) for shard in prepared.shards] == [MAX_CANDIDATES_PER_BATCH, 3]
-    assert [label for shard in prepared.shards for label in shard.labels] == list(prepared.labels)
-    for state, questions in prepared.requests:
-        limits.check_request(state, questions)
-    client, calls = jev(asked_only({}))
+    assert [label for shard in prepared.shards for label in shard.labels] == labels
+    for index, shard in enumerate(prepared.shards):
+        limits.check_request(shard.state, shard.questions)
+        assert shard.state["window"]["shard"] == index, "a real shard says which one it is"
+        assert shard.state["window"]["shards"] == 2
+        assert shard.state["window"]["candidates_total"] == len(candidates)
+    scripted = answers(
+        relevance={label: MIDDLING for label in labels},
+        poison={label: QUIET for label in labels},
+        contradicts={label: QUIET for label in labels},
+        labels=labels,
+    )
+    client, calls = jev(asked_only(scripted))
     decision = rerank(client, QUERY, candidates, overflow=OVERFLOW_SHARD)
     assert len(calls) == 2
     assert decision.shards == 2
     assert len(decision.judged) == len(candidates)
     assert len(decision.order) == len(candidates), "sharding must not lose a candidate"
+    assert all(record.poison == pytest.approx(QUIET) for record in decision.judged.values())
+    assert decision.screened is True
+
+
+def test_sharding_splits_on_tokens_not_only_on_the_candidate_count(jev):
+    """The token arithmetic, which the count-driven tests never reach.
+
+    Twenty passages at the passage budget are far fewer than MAX_CANDIDATES_PER_BATCH and
+    still do not fit one request, so `_pack` must split them on BATCH_STATE_TOKENS. The
+    reserve is what keeps each shard inside the documented 32k/64k budgets.
+    """
+    candidates = [
+        Candidate(f"big{index}", f"refund policy {index}. " * PASSAGE_CHARS_BUDGET)
+        for index in range(20)
+    ]
+    with pytest.raises(RequestTooLarge, match="Nothing was truncated"):
+        plan(QUERY, candidates)
+    prepared = plan(QUERY, candidates, overflow=OVERFLOW_SHARD)
+    sizes = [len(shard.labels) for shard in prepared.shards]
+    assert sum(sizes) == len(candidates), "packing never drops a candidate"
+    assert len(sizes) > 1, "20 candidates must not fit one request on tokens"
+    assert max(sizes) < MAX_CANDIDATES_PER_BATCH, "this split is on tokens, not on the count"
+    for shard in prepared.shards:
+        limits.check_request(shard.state, shard.questions)
+        state_tokens = limits.estimate_tokens(shard.state)
+        question_tokens = sum(limits.estimate_tokens(q) for q in shard.questions.values())
+        assert state_tokens <= BATCH_STATE_TOKENS, "the reserve is held back from the 32k budget"
+        assert state_tokens + question_tokens <= BATCH_TOTAL_TOKENS
+        # Not `STATE_PLUS_LONGEST_QUESTION_TOKENS - state_tokens >= STATE_TOKEN_RESERVE`: that
+        # is the line above restated, because BATCH_STATE_TOKENS is defined as the difference.
+        # What the reserve has to cover is the quantity the 32k budget pairs the state with,
+        # which is the *longest* question. This fails if a question ever grows past it.
+        longest = max(limits.estimate_tokens(q) for q in shard.questions.values())
+        assert longest <= STATE_TOKEN_RESERVE, (
+            f"the longest question measures {longest} tokens against a reserve of "
+            f"{STATE_TOKEN_RESERVE} held back from the state budget for it"
+        )
+    client, calls = jev(asked_only(answers(labels=list(prepared.labels))))
+    decision = rerank(client, QUERY, candidates, overflow=OVERFLOW_SHARD)
+    assert len(calls) == len(sizes)
+    assert len(decision.judged) == len(candidates)
+
+
+def test_exactly_the_request_ceiling_is_planned_not_refused():
+    """The accepting side of MAX_REQUESTS: 64 pairs is 64 requests, 65 is refused."""
+    prepared = plan(QUERY, short(MAX_REQUESTS), mode=MODE_PER_PAIR)
+    assert len(prepared.shards) == MAX_REQUESTS
+    assert len(prepared.entries) == MAX_REQUESTS
 
 
 def test_a_per_pair_fan_out_over_the_request_ceiling_is_refused(jev):
@@ -424,12 +641,56 @@ def test_a_per_pair_fan_out_over_the_request_ceiling_is_refused(jev):
     assert decision.reason == "refused"
 
 
-def test_a_candidate_that_cannot_fit_a_request_alone_is_refused():
-    huge = Candidate("huge", "text", source="y" * (limits.CONTEXT_TOKENS * limits.CHARS_PER_TOKEN))
+def test_a_candidate_that_cannot_fit_a_request_alone_is_refused(monkeypatch):
+    """The guard behind both budgets, reached by raising the clip budget above a request.
+
+    With PASSAGE_CHARS_BUDGET and SOURCE_CHARS_BUDGET both enforced, no candidate can
+    overflow a request on its own any more — which is the point of enforcing them. The guard
+    stays, because it is what catches a budget raised past what one request can hold.
+    """
+    monkeypatch.setattr(R, "PASSAGE_CHARS_BUDGET", limits.CONTEXT_TOKENS * limits.CHARS_PER_TOKEN)
+    huge = Candidate("huge", "y" * (limits.CONTEXT_TOKENS * limits.CHARS_PER_TOKEN))
     with pytest.raises(RequestTooLarge, match="on its own"):
         plan(QUERY, [huge], mode=MODE_PER_PAIR)
     with pytest.raises(RequestTooLarge, match="on its own"):
         plan(QUERY, [huge], overflow=OVERFLOW_SHARD)
+
+
+def test_an_unbounded_source_cannot_swallow_a_batched_request(jev):
+    """`source` is caller metadata, and it used to reach the state unclipped and unreported.
+
+    An unclipped source pushed other candidates into another shard and showed up in no field
+    of the decision. This case uses five times the budget, and the assertions below are the
+    measurement: whatever share it would have taken, the clip and the report are what matter.
+    """
+    long_source = "s" * (SOURCE_CHARS_BUDGET * 5)
+    candidates = [Candidate("b", "Refunds are issued within 14 days.", source=long_source)]
+    prepared = plan(QUERY, candidates)
+    view = prepared.shards[0].state["candidates"]["c0"]
+    cut = len(long_source) - SOURCE_CHARS_BUDGET
+    assert len(view["source"]) == SOURCE_CHARS_BUDGET, "the source reaches the state clipped"
+    assert view["source_clipped_chars"] == cut
+    assert prepared.source_clipped_chars == cut
+    client, _ = jev(asked_only(answers(labels=["c0"])))
+    decision = rerank(client, QUERY, candidates)
+    record = decision.judged["b"]
+    assert record.source_clipped_chars == cut
+    assert FLAG_SOURCE_CLIPPED in record.reasons
+    assert decision.source_clipped_chars == cut
+    assert "clipped from candidate sources" in decision.line()
+    assert record.kept is True, "caller metadata is never a reason to drop a passage"
+    assert FLAG_CLIPPED not in record.reasons, "the text was sent whole"
+    assert decision.screened is True, "the poison check reads `text`, which was not clipped"
+
+
+def test_a_source_inside_its_budget_is_sent_whole_and_flags_nothing(jev):
+    """The other side of SOURCE_CHARS_BUDGET."""
+    source = "s" * SOURCE_CHARS_BUDGET
+    prepared = plan(QUERY, [Candidate("b", "Refunds are issued within 14 days.", source=source)])
+    view = prepared.shards[0].state["candidates"]["c0"]
+    assert view["source"] == source
+    assert "source_clipped_chars" not in view
+    assert prepared.source_clipped_chars == 0
 
 
 def test_a_query_over_budget_is_refused_rather_than_clipped():
@@ -471,10 +732,36 @@ def test_an_injection_past_the_clip_budget_is_not_certified_as_screened(jev):
     assert decision.partly_screened == ("long",)
 
 
+@pytest.mark.parametrize(
+    "length,clipped",
+    [(PASSAGE_CHARS_BUDGET, False), (PASSAGE_CHARS_BUDGET + 1, True)],
+    ids=["exactly_the_budget", "one_over"],
+)
+def test_the_passage_budget_decides_on_both_sides(jev, length, clipped):
+    """A passage exactly at the budget is sent whole; one character more clips.
+
+    The clipped side had a test; the side that must *not* clip did not, so nothing caught a
+    budget that clipped one character early and took `screened` down with it.
+    """
+    candidates = [Candidate("p", "r" * length)]
+    prepared = plan(QUERY, candidates)
+    view = prepared.shards[0].state["candidates"]["c0"]
+    assert (len(view["text"]) < length) is clipped
+    assert ("clipped_chars" in view) is clipped
+    client, _ = jev(asked_only(answers(labels=["c0"])))
+    decision = rerank(client, QUERY, candidates)
+    assert (FLAG_CLIPPED in decision.judged["p"].reasons) is clipped
+    assert (decision.partly_screened == ("p",)) is clipped
+    assert decision.screened is not clipped
+
+
 def test_nothing_clipped_means_fully_screened(jev):
     client, _ = jev(asked_only(answers(labels=["c0"])))
     decision = rerank(client, QUERY, [Candidate("short", "Refunds are issued within 14 days.")])
     assert decision.partly_screened == ()
+    assert decision.clipped_chars == 0
+    assert decision.source_clipped_chars == 0
+    assert decision.judged["short"].reasons == ()
     assert decision.screened is True
 
 
@@ -515,6 +802,95 @@ def test_duplicate_candidate_ids_and_a_blank_query_raise():
 
 
 # --- the arithmetic ---------------------------------------------------------
+
+
+#: The synthetic set behind the last four rows of the cost table in `docs/rerank.md`. The doc
+#: cites this file for them, so every number in that table comes from something a reader can
+#: run. `limits.estimate_tokens` is a four-characters-per-token estimate and not a tokenizer:
+#: these are this repo's own conservative count, and a live call reports its own, normally lower.
+PRICED_PASSAGE_CHARS = 900
+PRICED_SET = [
+    Candidate(
+        f"kb-{index}",
+        ("refund policy detail. " * 50)[:PRICED_PASSAGE_CHARS],
+        source="kb/refunds",
+    )
+    for index in range(MAX_CANDIDATES_PER_BATCH)
+]
+#: A long query, to price the one cost per-pair mode pays that batched does not: the query
+#: again in every request. Its length is the only thing that matters here, not its wording.
+PRICED_LONG_QUERY_CHARS = 5_760
+
+
+def example_module():
+    """`examples/rerank.py`, loaded by path: it is what the table's first two rows are about.
+
+    Imported for its constants only; its `main()` is behind `if __name__ == "__main__":` and
+    never runs here, so nothing in this test touches the network.
+    """
+    spec = importlib.util.spec_from_file_location("rerank_example", ROOT / "examples" / "rerank.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_documented_per_question_tokens_are_what_build_questions_produces():
+    """The per-question table in `docs/rerank.md`: three questions, and their sum per candidate."""
+    questions = R.build_questions(["c0"])
+    tokens = {qid: limits.estimate_tokens(question) for qid, question in questions.items()}
+    assert tokens[relevance_id("c0")] == 374
+    assert tokens[poison_id("c0")] == 306
+    assert tokens[contradicts_id("c0")] == 258
+    assert sum(tokens.values()) == 938, "the fixed per-candidate question block"
+
+
+def test_the_documented_cost_table_is_what_estimate_cost_produces():
+    """Every row of the table in `docs/rerank.md`, regenerated. Update the doc when this fails.
+
+    Stale cost numbers are the failure this pins: the table is arithmetic over the questions
+    and the state, and both change when the review block does.
+    """
+    example = example_module()
+    long_query = ((example.QUERY + " Also list every exception to it. ") * 80)[
+        :PRICED_LONG_QUERY_CHARS
+    ]
+    assert len(example.CANDIDATES) == 8 and len(example.QUERY) == 65, "the doc names both"
+    assert len(long_query) == PRICED_LONG_QUERY_CHARS
+
+    rows = {
+        ("example", MODE_BATCHED): (example.QUERY, example.CANDIDATES, 1, 7_955),
+        ("example", MODE_PER_PAIR): (example.QUERY, example.CANDIDATES, 8, 8_257),
+        ("priced", MODE_BATCHED): (example.QUERY, PRICED_SET, 1, 37_639),
+        ("priced", MODE_PER_PAIR): (example.QUERY, PRICED_SET, 32, 38_988),
+        ("long_query", MODE_BATCHED): (long_query, PRICED_SET, 1, 39_063),
+        ("long_query", MODE_PER_PAIR): (long_query, PRICED_SET, 32, 84_534),
+    }
+    #: The doc's "per million reranks" column, to the cent. It is the one-rerank column times
+    #: 1e6, and publishing six dollar figures off an unasserted multiplication is how a cost
+    #: table goes stale without anything failing.
+    per_million = {
+        ("example", MODE_BATCHED): 334.11,
+        ("example", MODE_PER_PAIR): 346.79,
+        ("priced", MODE_BATCHED): 1_580.84,
+        ("priced", MODE_PER_PAIR): 1_637.50,
+        ("long_query", MODE_BATCHED): 1_640.65,
+        ("long_query", MODE_PER_PAIR): 3_550.43,
+    }
+    for (name, mode), (query, candidates, requests, tokens) in rows.items():
+        report = estimate_cost(query, candidates, mode=mode)
+        assert (report.requests, report.input_tokens) == (requests, tokens), f"{name}/{mode}"
+        assert report.usd == pytest.approx(tokens * 42 / 1e9), "the dollar column is the token one"
+        assert report.usd * 1e6 == pytest.approx(per_million[(name, mode)], abs=0.005), (
+            f"{name}/{mode}: the doc publishes ${per_million[(name, mode)]:,.2f} per million reranks"
+        )
+
+    #: The state cost of one passage, which the doc quotes as a range beside the question block.
+    marginal = [
+        limits.estimate_tokens(R.build_state(example.QUERY, {entry.label: entry.view}))
+        - limits.estimate_tokens(R.build_state(example.QUERY, {}))
+        for entry in plan(example.QUERY, example.CANDIDATES).entries
+    ]
+    assert (min(marginal), max(marginal)) == (31, 89)
 
 
 def test_per_pair_costs_more_than_batched_for_the_same_set():

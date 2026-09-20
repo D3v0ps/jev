@@ -15,6 +15,14 @@ the caller's fixed move enum with the legal set, so an illegal move is not an op
 the request and cannot come back from it. The reply is an index into constants the
 caller already holds.
 
+Set `Tick.catalogue` to that fixed enum and `next_move` does the intersection itself,
+which is where the guarantee belongs: descriptions and option order then come from the
+catalogue rather than from `legal`, an id in `legal` that the catalogue does not hold
+holds the tick (`reason="failed"`, no request sent) instead of being offered, and a
+`safe_default` outside the catalogue raises — a hold that executes an unknown move is
+not a hold. Leaving `catalogue` unset keeps the older behaviour, where `legal` is trusted
+because the caller already called `offer` itself.
+
 Three things a loop needs that a text model does not give you:
 
 1. **A deadline.** `next_move` wraps the request in `asyncio.wait_for(budget_ms)`. A
@@ -25,7 +33,13 @@ Three things a loop needs that a text model does not give you:
    passes a `fingerprint` in, and a `fingerprint_now` callable that is read again when
    the answer lands. If it changed, the decision is dropped. This is the bug naive
    versions of this loop ship: a confident, correct decision about a world that no
-   longer exists. It is a tested contract here, not a nicety.
+   longer exists. It is a tested contract here, not a nicety — and `fingerprint_now`
+   has **no default**, so it cannot be lost by forgetting a keyword argument. A caller
+   who has genuinely frozen the world for the tick passes `fingerprint_now=None`; that
+   opt-out is visible at the call site, every decision made under it carries
+   `staleness_checked=False`, `LoopReport.unchecked_staleness` counts them, and
+   `sustains()` refuses such a run, because `stale_drops == 0` means nothing when the
+   check never ran.
 3. **Fail closed.** Rejected answer, refused request (too large), transport failure,
    no legal moves, observation that reads as an order: every path returns the caller's
    safe default with `safe=True` and a `reason`, and none of them raises. A loop that
@@ -67,7 +81,8 @@ All of them live in the one review block at the top of the module.
 | `TARGET_RATE_PER_SECOND` | 10.0 | Not a measurement: the hypothesis `LoopReport.sustains()` is the instrument for. |
 
 Two thresholds, not one, is the whole point of `Tick.committing`: the same answer at
-0.68 confidence is executed for a turn and held for a step off a ledge.
+0.675 confidence — midway between the two bars, `(0.55 + 0.80) / 2` — is executed for a
+turn and held for a step off a ledge.
 `tests/test_realtime_loop.py::test_the_bar_moves_with_the_stakes_not_with_the_answer`
 is that sentence as a test.
 
@@ -76,30 +91,49 @@ is that sentence as a test.
 From `jevkit.cost`: jev-1.13.0 is **$42 per billion input tokens** ($0.042 per million),
 and output tokens are free. One tick is one request.
 
-Measured offline for the request `examples/realtime_loop.py` builds on its first tick,
-with `jevkit.limits.estimate_tokens` over the real encoded body and `jevkit.cost` for
-the price. These are size estimates at 4 chars/token, not a billed figure from a live
-call:
+Counted offline over the request `examples/realtime_loop.py` builds on **tick 0**: its
+`build_state` output and its four `build_questions`, encoded as they go on the wire, run
+through `jevkit.limits.estimate_tokens` and priced with `jevkit.cost`. `estimate_tokens`
+is a ~4-characters-per-token size estimate, **not a tokenizer and not a billed figure** —
+a live call's `usage.input_tokens` will differ. Every number below is asserted by
+`tests/test_realtime_loop.py::test_the_documented_cost_table_is_what_the_code_produces`,
+which is also the script that produced it:
+
+```python
+example, tick = example_first_tick()                     # examples/realtime_loop.py, tick 0
+offered, _ = cap_moves(offer(example.MOVES, tick.legal))  # 4 moves: no reversing yet
+state = limits.estimate_tokens(build_state(tick))
+per_question = {qid: limits.estimate_tokens(q) for qid, q in build_questions(offered, tick.goal).items()}
+cost.usd_for("jev-1.13.0", state + sum(per_question.values()))
+```
+
+`example_first_tick()` is the helper in that test file; reproduce the whole table offline,
+with no key, by running it:
+`.venv/bin/python -m pytest tests/test_realtime_loop.py -k cost_table`.
 
 | | tokens |
 | --- | --- |
 | state (`goal`, `plan`, `world`, `fingerprint`) | 86 |
-| `move` (5 described moves) | 235 |
+| `move` (4 described moves — `reverse` is illegal on tick 0, so it is not offered) | 235 |
 | `threat` (4 levels) | 137 |
 | `plan_holds` | 108 |
 | `steering` | 128 |
 | **one tick** | **694** |
 
+- All five moves described would make the `move` question 251 tokens; tick 0 offers four.
 - `cost.usd_for("jev-1.13.0", 694)` = **$0.0000291 per tick** — about 34,000 ticks per
   dollar.
-- At 10 decisions/s: $0.0291 per 1,000 ticks, **$1.05 per robot-hour**, $8.39 per
+- Arithmetic on that per-tick figure, *if* a loop holds 10 decisions/s (a hypothesis, not
+  a rate measured here): $0.0291 per 1,000 ticks, **$1.05 per robot-hour**, $8.39 per
   8-hour shift.
 - The four questions are 608 of those 694 tokens, and they are the same every tick, so
   cost scales with how much world you send. Trimming the observation is the lever;
   trimming the rubric is not worth it.
-- A 255-move Choice costs ~1,012 tokens for that one question. State plus the longest
-  question here is 321 tokens against the documented 32k ceiling, so the binding limit
-  in practice is the option count, not the context.
+- A 255-option `move` question costs what its ids cost: ~1,034 tokens for bare 2–4
+  character ids (`m0`…`m254`) with this example's goal and no descriptions, ~1,316 with
+  8-character ids (`move_000`-style). State plus the longest question here is 321 tokens
+  against the documented 32k ceiling, so the binding limit in practice is the option
+  count, not the context.
 
 `LoopReport.usd` is the ledger's own delta for the run, so the example prints the
 dollars that run actually spent rather than this table.
@@ -107,12 +141,14 @@ dollars that run actually spent rather than this table.
 ## Rate arithmetic
 
 `limits.REQUESTS_PER_MINUTE` is 1,200 — an **account** ceiling, not a per-loop one.
-`Account` does the division:
+`Account` does the division. One call, one line — the account rate and this fleet's demand
+together:
 
-```
-1200/min = 20 requests/s across the account
-2 loop(s) x 10/s = 20/s wanted · 2 loop(s) fit · fits
-3 loop(s) x 10/s = 30/s wanted · 2 loop(s) fit · needs pacing or more quota
+```pycon
+>>> Account(loops=2).line()
+'1200/min = 20 requests/s across the account · 2 loop(s) x 10/s = 20/s wanted · 2 loop(s) fit · fits'
+>>> Account(loops=3).line()
+'1200/min = 20 requests/s across the account · 3 loop(s) x 10/s = 30/s wanted · 2 loop(s) fit · needs pacing or more quota'
 ```
 
 At one request per tick, 10 decisions/s means **two robots on a key**. A third needs
@@ -120,18 +156,41 @@ pacing or more quota; `run(..., limiter=RateLimiter())` installs a
 `jevkit.pacing.RateLimiter` for the run and hands the client back unpaced afterwards.
 Two limiters on one client are refused, because each would think it owned the quota.
 
+## What a run reports
+
+`LoopReport` separates the loop's cadence from its decisions, because a loop can tick
+very fast while deciding nothing at all:
+
+| field | what it is |
+| --- | --- |
+| `achieved_rate` | Ticks per second, including every held tick. Cadence, not decisions. |
+| `chosen_rate` | Moves per second the model actually chose (`reason == "chosen"`). |
+| `p50_ms` / `p95_ms` | Request latency percentiles from the ledger; `None` when no answer landed. |
+| `overhead_s` | Wall time minus the request waits the *ledger* recorded, so a burned deadline and a tick that never asked both count as overhead. |
+| `deadline_misses`, `stale_drops`, `unchecked_staleness`, `safe_defaults`, `preempts` | Counts over the run's decisions. |
+| `calls`, `input_tokens`, `usd` | The ledger's own deltas for this run — a floor on spend, since a cancelled tick may have cost a request no answer came back from. |
+
+`sustains(target)` is the certificate, so it is deliberately hard to get: it wants
+`chosen_rate >= target` **and** no deadline miss, no stale drop, and no answer used
+without a staleness check. Rating `achieved_rate` instead would certify a loop that held
+every one of its ticks, or one that sent no request at all —
+`tests/test_realtime_loop.py::test_a_run_that_chose_no_move_sustains_nothing` pins both
+cases down.
+
 ## Honest limits
 
 - **The 10+/s claim is not measured here, and this repo cannot measure it without a
-  key.** `run()` is the instrument: `LoopReport` carries the achieved rate, p50/p95 from
-  the ledger, deadline misses and stale drops, and `sustains(target)` compares them to a
-  target. Run the example against your own account and read its last three lines. The
-  only rate this repo can produce offline is the recipe's own overhead: driving
-  `examples/realtime_loop.py` for its 12 ticks against the mock transport in
-  `jevkit.testing` reports 0.4 ms per tick of non-request time (`LoopReport.overhead_s`,
-  three runs, same figure). That says the harness is not the bottleneck. It says nothing
-  whatsoever about model latency, and the ~1,000 ticks/s such a run prints is the speed
-  of a mock, not of Jev.
+  key.** `run()` is the instrument: `LoopReport` carries the tick cadence, the rate of
+  moves actually chosen, p50/p95 from the ledger, deadline misses, stale drops and
+  unchecked staleness, and `sustains(target)` compares them to a target. Run the example
+  against your own account and read its last three lines. **No tick rate or overhead
+  figure is quoted in this repo**, and a number measured against the mock transport in
+  `jevkit.testing` would be the speed of a mock rather than of Jev. What is committed is
+  the *accounting*, not a figure:
+  `tests/test_realtime_loop.py::test_overhead_counts_every_millisecond_no_answer_was_waited_for`
+  asserts that a run which never got an answer reports all of its wall time as
+  `overhead_s`, and that a run which did gets exactly the ledger's request waits
+  subtracted. Read your own `report.summary()` for numbers; do not read them here.
 - **A missed deadline is a held tick, not a retry.** If the model's p95 sits above
   `TICK_BUDGET_MS`, the loop degrades to holding a lot. Read `deadline_misses` before
   believing a tick rate, and raise the budget or lower the rate rather than removing

@@ -19,7 +19,9 @@ Four things make this safe to run in a loop rather than merely fast:
 - **A staleness check.** The world moves while the request is in flight. The caller
   supplies an opaque world fingerprint; if it changed by the time the answer lands,
   the decision is discarded. A decision about a world that no longer exists is not
-  safe to execute, however confident it was.
+  safe to execute, however confident it was. `fingerprint_now` has no default, so
+  skipping the check is something a call site says out loud (`fingerprint_now=None`)
+  and every decision made without it carries `staleness_checked=False`.
 - **Speculative questions.** Threat, and whether the current plan still holds, ride
   along in the same request, so the loop can pre-empt itself without a second call.
 - **Fail closed.** A rejected answer, a refused request, a transport failure, no
@@ -34,7 +36,9 @@ deployment rather than something this module asserts.
 
 The model chooses among move ids; it never names one. An illegal move is not
 offered, so it cannot be chosen: `offer()` intersects the caller's fixed move
-catalogue with the legal set, and anything outside the catalogue is refused.
+catalogue with the legal set, and anything outside the catalogue is refused. Set
+`Tick.catalogue` and `next_move` does that intersection itself, so the guarantee is
+enforced where the request is built rather than left to the caller.
 """
 
 from __future__ import annotations
@@ -191,6 +195,18 @@ def build_questions(offered: Mapping[str, Any], goal: Any) -> dict[str, Any]:
 # --- end of review block ----------------------------------------------------
 
 
+class _Unchecked:
+    """The type of `UNCHECKED`; a class so the sentinel has a readable repr in a log."""
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return "UNCHECKED"
+
+
+#: `decide(landed_fingerprint=UNCHECKED)` means the caller did not read the world again,
+#: so staleness was not checked. A distinct object rather than None, because None is a
+#: perfectly good fingerprint for a caller to use.
+UNCHECKED = _Unchecked()
+
 #: Why a decision came out the way it did. Everything but "chosen" is the safe default.
 Reason = Literal[
     "chosen",
@@ -212,9 +228,13 @@ class Tick:
     `legal` is the moves that are legal *now*: a mapping of move id to description,
     or a bare sequence of ids. It must come from a fixed catalogue the caller holds
     (see `offer`), never from anything `world` said, since an id that is offered is
-    an id that can be chosen. `fingerprint` is any comparable value identifying this
-    world — a tick counter, a state hash, a (pose, sensor_seq) tuple. `committing`
-    names the legal moves the caller cannot take back next tick.
+    an id that can be chosen. Set `catalogue` to the whole fixed move enum and
+    `next_move` enforces that itself: it offers `offer(catalogue, legal)` — catalogue
+    order, catalogue descriptions — so a `legal` set that picked up an id from
+    somewhere untrusted never reaches the wire, and `safe_default` has to be a move in
+    the catalogue too. `fingerprint` is any comparable value identifying this world — a
+    tick counter, a state hash, a (pose, sensor_seq) tuple. `committing` names the legal
+    moves the caller cannot take back next tick.
     """
 
     world: Any
@@ -224,6 +244,7 @@ class Tick:
     goal: Any = ""
     plan: Any = None
     committing: Collection[str] = ()
+    catalogue: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -234,6 +255,12 @@ class Decision:
     the model picked, so a log line can separate "decided to hold" from "could not
     decide". The evidence fields are None on the paths where no usable answer about
     the current world arrived, and `preempt` is only meaningful when they are not.
+
+    `staleness_checked` is True when the world's fingerprint was read again and matched,
+    False when an answer was used without that check (`fingerprint_now=None`), and None
+    when no answer arrived, so there was nothing to check. A decision that never had its
+    world re-read is not the same thing as one that passed the check, and a report that
+    conflated them would call a loop safe that never looked.
     """
 
     move: str
@@ -241,6 +268,8 @@ class Decision:
     safe: bool
     preempt: bool
     fingerprint: Any
+    #: The wait this tick spent: the request's own latency when an answer landed, the
+    #: elapsed tick time when none did. Not a request wait on the holds that never asked.
     latency_ms: float
     confidence: float | None = None
     required_confidence: float | None = None
@@ -249,11 +278,14 @@ class Decision:
     plan_holds: float | None = None
     steering: float | None = None
     dropped: tuple[str, ...] = ()
+    staleness_checked: bool | None = None
     detail: str = ""
 
     def line(self) -> str:
         """One log line: what was done, why, and on what evidence."""
         parts = [f"{self.move} ({self.reason})"]
+        if self.staleness_checked is False:
+            parts.append("staleness unchecked")
         if self.confidence is not None:
             parts.append(f"confidence {self.confidence:.2f} vs {self.required_confidence:.2f}")
         if self.threat is not None:
@@ -277,7 +309,9 @@ class LoopReport:
     decisions: tuple[Decision, ...]
     wall_s: float
     #: Wall time this run spent on anything other than waiting for an answer: sensing,
-    #: acting, pacing, period sleeps, and the deadline it burned on a missed tick.
+    #: acting, pacing, period sleeps, and the deadline it burned on a missed tick. The
+    #: answer waits subtracted are the ledger's own, so a request that never came back
+    #: leaves its wait here rather than hiding it.
     overhead_s: float
     calls: int
     input_tokens: int
@@ -286,8 +320,21 @@ class LoopReport:
 
     @property
     def achieved_rate(self) -> float:
-        """Decisions per second this loop actually completed, including safe defaults."""
+        """Ticks per second this loop completed, including the ones it held.
+
+        This is the loop's cadence, not its decision rate: a tick that held because it
+        had nothing to choose between, or never asked, counts here too. Use
+        `chosen_rate` for the rate of moves the model actually decided.
+        """
         return self.ticks / self.wall_s if self.wall_s > 0 else float("inf")
+
+    @property
+    def chosen_rate(self) -> float:
+        """Moves per second the model actually chose: ticks with reason "chosen"."""
+        chosen = self.count("chosen")
+        if self.wall_s > 0:
+            return chosen / self.wall_s
+        return float("inf") if chosen else 0
 
     @property
     def p50_ms(self) -> float | None:
@@ -324,13 +371,38 @@ class LoopReport:
     def preempts(self) -> int:
         return sum(1 for decision in self.decisions if decision.preempt)
 
+    @property
+    def unchecked_staleness(self) -> int:
+        """Answers acted on without re-reading the world: `fingerprint_now` was None."""
+        return sum(1 for decision in self.decisions if decision.staleness_checked is False)
+
     def sustains(self, target_per_second: float = TARGET_RATE_PER_SECOND) -> bool:
-        """Did this run hold `target_per_second` with no deadline miss and no stale decision?"""
-        return self.achieved_rate >= target_per_second and not self.deadline_misses and not self.stale_drops
+        """Did this run *decide* `target_per_second` moves, safely?
+
+        The rate is `chosen_rate`, not `achieved_rate`: a loop that held every tick
+        burned ticks rather than making decisions, and certifying it would make this the
+        one instrument the recipe's 10+/s hypothesis defers to and also the one that
+        cannot tell a working loop from an idle one. A run with a missed deadline, a
+        stale drop, or an answer used without a staleness check sustains nothing —
+        `stale_drops == 0` means nothing when the check never ran.
+        """
+        return (
+            self.chosen_rate >= target_per_second
+            and not self.deadline_misses
+            and not self.stale_drops
+            and not self.unchecked_staleness
+        )
 
     def summary(self) -> str:
-        """One line for a demo or a log. Latency is per request; the rate is per tick."""
-        rate = f"{self.achieved_rate:.1f}/s achieved over {self.ticks} ticks"
+        """One line for a demo or a log.
+
+        Latency is per request; the first rate is ticks, the second is moves chosen, and
+        the overhead is per tick over the whole run.
+        """
+        rate = (
+            f"{self.achieved_rate:.1f}/s ticks achieved over {self.ticks} ticks · "
+            f"{self.chosen_rate:.1f}/s moves chosen"
+        )
         latency = "no answers landed"
         if self.p50_ms is not None:
             latency = (
@@ -341,6 +413,7 @@ class LoopReport:
         return (
             f"{rate} · {latency} · {self.calls} requests · {self.input_tokens} input tokens · {money} · "
             f"{self.deadline_misses} deadline misses · {self.stale_drops} stale · "
+            f"{self.unchecked_staleness} unchecked · "
             f"{self.safe_defaults} safe defaults · {self.preempts} pre-empts · "
             f"{self.overhead_s * MS_PER_SECOND / max(1, self.ticks):.1f} ms/tick overhead"
         )
@@ -381,8 +454,13 @@ def hold(
     *,
     detail: str = "",
     preempt: bool = False,
+    staleness_checked: bool | None = None,
 ) -> Decision:
-    """The safe default, with no evidence attached because none was usable."""
+    """The safe default, with no evidence attached because none was usable.
+
+    `staleness_checked` stays None on the paths where no answer arrived: there was
+    nothing to check, which is not the same as a check that was skipped.
+    """
     return Decision(
         move=tick.safe_default,
         reason=reason,
@@ -391,6 +469,7 @@ def hold(
         fingerprint=tick.fingerprint,
         latency_ms=latency_ms,
         dropped=dropped,
+        staleness_checked=staleness_checked,
         detail=detail,
     )
 
@@ -407,15 +486,20 @@ def decide(
 
     `landed_fingerprint` is the world's fingerprint at the moment the answer landed,
     read by the caller. Different from the tick's, and the decision is discarded:
-    it answers a question about a world that is gone.
+    it answers a question about a world that is gone. Pass `UNCHECKED` when the caller
+    did not read the world again; the answer is then used, but every decision it
+    produces says so in `staleness_checked`, and `LoopReport.sustains` refuses a run
+    that did it.
     """
-    if landed_fingerprint != tick.fingerprint:
+    checked = landed_fingerprint is not UNCHECKED
+    if checked and landed_fingerprint != tick.fingerprint:
         return hold(
             tick,
             "stale",
             latency_ms,
             dropped,
             detail=f"world moved from {tick.fingerprint!r} to {landed_fingerprint!r} in flight",
+            staleness_checked=True,
         )
     try:
         move = reply.picked(MOVE)
@@ -425,7 +509,9 @@ def decide(
         plan_holds = reply.noul(PLAN_HOLDS)
         steering = reply.noul(STEERING)
     except AnswerRejected as rejected:
-        return hold(tick, "rejected", latency_ms, dropped, detail=str(rejected))
+        return hold(
+            tick, "rejected", latency_ms, dropped, detail=str(rejected), staleness_checked=checked
+        )
 
     high_stakes = threat >= THREAT_ESCALATE
     required = (
@@ -443,6 +529,7 @@ def decide(
         "plan_holds": plan_holds,
         "steering": steering,
         "dropped": dropped,
+        "staleness_checked": checked,
     }
     preempt = high_stakes or plan_holds < PLAN_HOLDS_FLOOR
 
@@ -471,21 +558,29 @@ async def next_move(
     jev: Any,
     tick: Tick,
     *,
-    fingerprint_now: Callable[[], Any] | None = None,
+    fingerprint_now: Callable[[], Any] | None,
     budget_ms: float = TICK_BUDGET_MS,
     model: str | None = None,
 ) -> Decision:
     """One tick: one request, under a deadline, discarded if the world moved.
 
     `jev` is an `AsyncJev`; a control loop cannot block on I/O and hold a tick rate.
-    `fingerprint_now` reads the world's fingerprint again once the answer lands.
-    Leave it out only when the caller has already frozen the world for this tick —
-    without it there is nothing to compare, so staleness is not checked.
+    `fingerprint_now` reads the world's fingerprint again once the answer lands. It has
+    no default on purpose: pass `None` only when the caller has already frozen the world
+    for this tick, and that opt-out is then visible at the call site, marked on the
+    decision (`staleness_checked=False`) and counted in `LoopReport.unchecked_staleness`.
+
+    A `tick.catalogue` is enforced here: an id in `tick.legal` that is not a move in the
+    catalogue never reaches the wire, it holds the tick instead. A `safe_default` outside
+    the catalogue raises, because a hold that executes an unknown move is not a hold.
     """
+    if tick.catalogue is not None and tick.safe_default not in tick.catalogue:
+        raise KeyError(f"safe default {tick.safe_default!r} is not a move in the catalogue")
     started = time.perf_counter()
     dropped: tuple[str, ...] = ()
     try:
-        offered, dropped = cap_moves(tick.legal)
+        legal = tick.legal if tick.catalogue is None else offer(tick.catalogue, tick.legal)
+        offered, dropped = cap_moves(legal)
         if not offered:
             return hold(tick, "no_legal_moves", _elapsed_ms(started), dropped)
         request = (build_state(tick), build_questions(offered, tick.goal))
@@ -499,7 +594,7 @@ async def next_move(
         # A loop that raises stops being a loop: an unexpected failure is one held tick.
         detail = f"{type(failure).__name__}: {failure}"
         return hold(tick, "failed", _elapsed_ms(started), dropped, detail=detail)
-    landed = tick.fingerprint if fingerprint_now is None else fingerprint_now()
+    landed = UNCHECKED if fingerprint_now is None else fingerprint_now()
     return decide(
         reply,
         tick,
@@ -514,8 +609,8 @@ async def run(
     sense: Callable[[int], Tick],
     *,
     ticks: int,
+    fingerprint_now: Callable[[], Any] | None,
     act: Callable[[Decision], Any] | None = None,
-    fingerprint_now: Callable[[], Any] | None = None,
     budget_ms: float = TICK_BUDGET_MS,
     period_s: float | None = None,
     limiter: RateLimiter | None = None,
@@ -523,7 +618,9 @@ async def run(
 ) -> LoopReport:
     """Drive the loop for `ticks` ticks and report what it managed.
 
-    `sense(index)` builds the tick, `act(decision)` executes `decision.move` — every
+    `sense(index)` builds the tick, `fingerprint_now` re-reads the world when each answer
+    lands (required, as in `next_move`; `None` is the visible opt-out and shows up as
+    `LoopReport.unchecked_staleness`), `act(decision)` executes `decision.move` — every
     decision, including the safe defaults. `period_s` spaces the ticks like a real
     control period; leaving it out runs flat out, which is how you measure the
     ceiling. `limiter` paces the loop against the account's ceiling; it is installed
@@ -533,6 +630,8 @@ async def run(
     The returned numbers are deltas over this run only, taken from the client's
     ledger. A tick cancelled at its deadline may still have cost a request that no
     answer came back from; the ledger counts answers, so treat `calls` as a floor.
+    `overhead_s` is wall time minus the request waits the *ledger* recorded, so a burned
+    deadline and a tick that never asked count as overhead, which is what they are.
     """
     if ticks < 0:
         raise ValueError("ticks must not be negative")
@@ -571,7 +670,11 @@ async def run(
 
     after = _snapshot(ledger)
     usd = after["usd"] - before["usd"] if not (after["unpriced"] - before["unpriced"]) else None
-    answered_s = sum(decision.latency_ms for decision in decisions) / MS_PER_SECOND
+    # Only the waits an answer actually came back from: a decision's own latency_ms is
+    # whole-tick elapsed time on the holds that never asked, so summing those would book
+    # a run of pure overhead as a run with none.
+    latencies = tuple(ledger.latencies_ms[before["samples"] :])
+    answered_s = sum(latencies) / MS_PER_SECOND
     return LoopReport(
         ticks=ticks,
         decisions=tuple(decisions),
@@ -579,7 +682,7 @@ async def run(
         calls=after["calls"] - before["calls"],
         input_tokens=after["input_tokens"] - before["input_tokens"],
         usd=usd,
-        latencies_ms=tuple(ledger.latencies_ms[before["samples"] :]),
+        latencies_ms=latencies,
         overhead_s=wall_s - min(wall_s, answered_s),
     )
 

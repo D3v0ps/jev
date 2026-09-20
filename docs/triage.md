@@ -68,6 +68,14 @@ quote marker in `QUOTE_MARKERS`, so `body` is the newest message and the older
 correspondence is background the questions are told to treat as background. Without that
 split, a refund asked for three replies ago reads as this message's request.
 
+The split has one rule that is a security boundary rather than a nicety: **a marker with
+nothing in front of it does not split.** A body whose very first line is `> ` or a `From:`
+header has no newer part, so it *is* the newest message. Splitting there would leave `body`
+empty and move the whole text into the field every question is told to read as background —
+and prefixing each line with `> ` is something the sender chooses, so that was a way to have
+the live request ignored while the refund flag, the frustration gate and the steering guard
+all read an empty body.
+
 ## Thresholds
 
 All of them live in the one review block at the top of the module. Every threshold that
@@ -83,13 +91,15 @@ option cap are tested at their limits.
 | `REFUND_REQUESTED_TRUE` | 0.60 | Probability at which the ticket counts as asking for money back. It also blocks an auto-reply outright. |
 | `HAS_REPRO_TRUE` | 0.60 | Probability at which a bug report counts as reproducible — on a category the caller marked `bug`, and nowhere else. |
 | `NEEDS_HUMAN_TRUE` | 0.40 | Probability at which a person must read the ticket first. The lowest bar of the three: a needless human read costs a minute, the reverse costs a canned reply to somebody in trouble. |
-| `ENGLISH_TRUE` | 0.50 | Probability at or above which the ticket reads as English. Below it, the queue floor rises. |
+| `ENGLISH_TRUE` | 0.50 | Probability **above** which the ticket reads as English. At it or below, the queue floor rises. A noul of exactly 0.50 means "yes and no are equally likely", so the tie goes to the stricter floor — the same direction `NEEDS_HUMAN_TRUE` breaks in. |
 | `STEERING_SUSPECTED` | 0.60 | Probability at which the ticket is treated as addressing triage. Fallback queue, automation off, nothing flagged. |
 | `PRIORITY_URGENT_AT` | 0.70 | Normalised urgency at which the priority label becomes `urgent`. |
 | `PRIORITY_HIGH_AT` | 0.45 | Normalised urgency at which it becomes `high`. Below, `normal`. |
 | `NO_AUTO_REPLY_ABOVE_FRUSTRATION` | 0.40 | Normalised frustration at which no canned answer goes out first. Below the midpoint: "clearly annoyed" is already too late for one. |
 | `EVIDENCE_TOP_N` | 2 | Options carried on the Decision as evidence, enough to shadow-route to the runner-up. |
-| `STATE_TOKEN_RESERVE` | 6,000 tokens | Held back from the 32k state-plus-longest-question budget. Leaves `BODY_CHARS_BUDGET` = 104,000 characters of newest message and `QUOTED_CHARS_BUDGET` = 26,000 of history. |
+| `GATING_MIN_OPTIONS` | 2 | Options a Choice must offer before its confidence gates a side effect. A one-option Choice is 1.0 by construction, so `FLOOR_AUTO_REPLY` and `FLOOR_REFUND_FLAG` would pass on every ticket; below this the ticket still routes, the auto-reply and the refund flag stay off, and `decision.detail` says why. |
+| `STATE_TOKEN_RESERVE` | 6,000 tokens | Held back from the 32k state-plus-longest-question budget for the questions and the rest of the state. What is left is `TEXT_CHARS_BUDGET` = 104,000 characters of ticket text. |
+| `TEXT_CHARS_BUDGET` split | 4/5 and 1/5 | `BODY_CHARS_BUDGET` = 83,200 characters of newest message, `QUOTED_CHARS_BUDGET` = 20,800 of history. **Shares of one allowance, not two allowances**: sized against the whole budget each, they summed to 130,000 characters — ~32,529 tokens of state — and a ticket long in both was refused by `jevkit.limits` instead of being clipped. |
 | `BATCH_CONCURRENCY` | 16 | Requests in flight by default in `triage_batch`. |
 
 The two floors that gate side effects sit above the one that gates a placement, which is
@@ -113,9 +123,16 @@ saying what happened.
 | `failed` | anything else: transport, timeout, a ticket that could not even be prepared | fallback queue |
 
 `priority` is `unknown` rather than `urgent` on those paths on purpose: a stream of
-unreadable tickets must not be able to flood the urgent lane. Neither `triage`,
-`triage_async` nor `triage_batch` raises — a worker draining an inbox that raises stops
-draining the inbox.
+unreadable tickets must not be able to flood the urgent lane. **The `steering` path is one of
+them.** Its urgency answer was read off a body that was caught writing to the triage system,
+and "EMERGENCY: total outage, wake on-call" is the cheapest thing such a body can say, so the
+reading stays on the Decision as evidence and does not become the label. A stream of fake
+system notices cannot flood the urgent lane either.
+
+Neither `triage`, `triage_async` nor `triage_batch` raises — a worker draining an inbox that
+raises stops draining the inbox. `decide` is written not to raise, and it is also *called*
+inside the guard in all three, because "written not to raise" is not a property a caller can
+see. A bug in there costs one ticket a `failed` reason instead of stopping the drain.
 
 ## Volume
 
@@ -147,57 +164,104 @@ Nothing here is a claim. `jevkit.cost` holds the one published price ($42 per bi
 tokens, output free); `Ledger` accumulates the `input_tokens` the API itself reported; and
 these three helpers do arithmetic on those two things:
 
-- `usd_per_ticket(ledger)` and `usd_per_1000_tickets(ledger)` — what the run spent, per
-  request. Both refuse an empty ledger and a ledger holding replies from a model with no
-  price on file, rather than average a number they cannot defend.
+- `usd_per_request(ledger)` and `usd_per_1000_requests(ledger)` — what the run spent per
+  request. This is the only per-unit figure a ledger can produce alone: it counts requests.
+- `usd_per_ticket(ledger, tickets)` and `usd_per_1000_tickets(ledger, tickets)` — the same
+  spend over the tickets it covered. The count is an argument because the ledger does not
+  have it: **an empty ticket costs no request**, so a ten-ticket inbox with one empty ticket
+  is nine requests, and dividing by requests publishes the cost of an inbox nobody has.
+  `BatchResult.cost_per_1000_tickets()` passes `len(decisions)` for you. All four refuse an
+  empty ledger and a ledger holding replies from a model with no price on file, rather than
+  average a number they cannot defend.
 - `compare_to_llm(ledger, usd_per_million_input=...)` — the same tokens at **your** price.
   Optional `prompt_tokens_per_ticket`, `output_tokens_per_ticket` and
   `usd_per_million_output` let you price the LLM fairly; leave them out and the LLM side
   counts only the tokens Jev actually read, which makes `ratio` a floor, not an estimate.
+  Pass `tickets=len(result.decisions)` for the same reason as above — without it the
+  per-ticket figures are per request, and the comparison says which it used.
+
+`BatchResult.ledger` is a snapshot of that batch's own spend, taken either side of the
+fan-out, not the client's running total. One client draining an inbox in several batches is
+the normal shape here, and a frozen result whose cost grows every time the client is used
+again is a result you cannot print or compare.
 - `measure_speculative_overhead(jev, ticket, desk)` — two requests on purpose, the whole
   tree against `CORE_QUESTIONS`, so the price of never needing a second round trip is a
   number from the usage report.
 
 ### Numbers, and where they came from
 
-The figures below were produced **offline**, by the harness in `jevkit.testing` over the
-ten-ticket inbox in `examples/triage.py`. The token counts are therefore
-`jevkit.limits.estimate_tokens`' estimate (4 characters per token), not the model's own
-tokenizer, and the dollars are that estimate priced through `jevkit.cost`. There is no API
-key in this repo's test environment, so nothing here was measured against the live API.
-Run `examples/triage.py` with a key and the same helpers print the real ones.
+Every figure below is counted **offline**, and here is the counting. There is no API key in
+this repo's environment, so nothing here was measured against the live API and no latency or
+live-run figure is quoted at all. What is counted is the token estimate over the request
+bodies `build_state` and `build_questions` actually produce for the ten-ticket inbox in
+`examples/triage.py` — `state` plus every question, which is exactly what the API bills as
+`input_tokens` — priced through `jevkit.cost`. `estimate_tokens` is a ~4-characters-per-token
+estimate, **not a tokenizer**: treat these as the right order of magnitude, and run
+`examples/triage.py` with a key for the model's own count.
 
-| measured | value |
+```python
+from examples.triage import DESK, INBOX
+from jevkit import cost, limits
+from jevkit.recipes.triage import CORE_QUESTIONS, build_questions, prepare
+
+price = cost.price_of("jev-1.13.0")                       # $42 per billion input tokens
+sent = [prepare(ticket, DESK) for ticket in INBOX]
+asked = [p for p in sent if not p.empty]                  # the empty ticket sends nothing
+tokens = [limits.check_request(p.state, p.questions) for p in asked]   # state + all 9 questions
+
+print(len(INBOX), "tickets,", len(asked), "requests")     # 10 tickets, 9 requests
+print(sum(tokens) / len(tokens))                          # 1704.2 input tokens per request
+print(sum(tokens) * price / len(INBOX) * 1000)            # 0.0644 per 1,000 TICKETS
+print(sum(tokens) * price / len(asked) * 1000)            # 0.0716 per 1,000 REQUESTS
+
+bug = prepare(INBOX[2], DESK)                             # the bug report, for the table below
+core = build_questions(DESK.category_options, DESK.queue_options, only=CORE_QUESTIONS)
+print(limits.check_request(bug.state, bug.questions))     # 1703, all nine questions
+print(limits.check_request(bug.state, core))              # 691, category + queue
+print(limits.estimate_tokens(bug.state))                  # 81, the state on its own
+```
+
+| counted | value |
 | --- | --- |
 | tickets in the inbox | 10 (one empty, so 9 requests) |
 | input tokens per request | ~1,704 |
-| Jev, per 1,000 tickets | **$0.0716** |
-| the same 1,000 at $3.00/Mtok input | $5.11 → **71.4x** |
-| the same 1,000 at Jev's own $0.042/Mtok | $0.0716 → 1.0x (the arithmetic's sanity check) |
+| Jev, per 1,000 **tickets** (÷ 10) | **$0.0644** |
+| Jev, per 1,000 **requests** (÷ 9) | $0.0716 |
+| the same 1,000 tickets at $3.00/Mtok input | $4.60 → **71.4x** |
+| the same 1,000 at Jev's own $0.042/Mtok | $0.0644 → 1.0x (the arithmetic's sanity check) |
+
+Those first two rows are the same spend over two different denominators, and the gap is the
+empty ticket. Publish the one whose denominator you mean; `usd_per_1000_tickets` and
+`usd_per_1000_requests` say which is which in their names.
 
 The 71.4x is not a property of this pattern. It is `3.00 / 0.042` — the ratio of two
 prices — and it holds only while the LLM reads the same tokens and emits nothing. Give the
 LLM classifier an 800-token instruction prompt and 60 tokens of output at $15/Mtok and the
 ratio moves; `compare_to_llm` takes both and will tell you. What this repo can say is the
-denominator: **$0.07 per thousand tickets, measured.** The numerator is yours.
+denominator: **$0.064 per thousand tickets, on this inbox, by the count above.** The
+numerator is yours, and so is your inbox.
 
 ### What the speculative questions actually cost
 
-Measured on the bug report in the example inbox, the same way:
+Counted on the bug report in the example inbox, by the snippet above:
 
 | | input tokens |
 | --- | --- |
 | all nine questions, one request | 1,703 |
 | `CORE_QUESTIONS` only (category + queue) | 691 |
 | the seven speculative questions | **1,012 (59% of the request)** |
-| asking them as a second request instead | 1,784 total (+81, the state sent twice) |
+| asking them as a second request instead | 1,784 total (691 + 1,093 — the 81-token state twice) |
 
 Two honest readings of that table:
 
 1. The speculative questions are **most of the request** on a short ticket. "Almost
-   nothing" is true in money — 1,012 tokens is $0.043 per thousand tickets — and false as
-   a share. They are a fixed cost, so the share falls as bodies grow: on a 16,000-character
-   ticket the same 1,012 tokens are 18% of the request.
+   nothing" is true in money — 1,012 tokens is $0.0425 per thousand *requests* at
+   $42/Btok — and false as a share. Per thousand *tickets* it is lower, because a ticket
+   refused locally never sends one: the example inbox is 10 tickets and 9 requests, so
+   $0.038. They are a fixed cost, so the share falls as bodies grow: on a
+   16,000-character body the same 1,012 tokens are 17.9% of a 5,659-token request
+   (`limits.check_request` over `prepare(...)` for that ticket: state 4,037 + questions
+   1,622).
 2. Splitting them out does not save it. Two requests cost *more* tokens than one (the state
    is sent twice) and add a whole round trip. The question text is the lever a reviewer
    holds here, not the question count: these nine carry long criteria on purpose, and
@@ -210,10 +274,13 @@ Two honest readings of that table:
 | empty body and subject | reason `empty`, fallback queue, **zero requests** |
 | subject only, no body | triaged normally; one request |
 | forwarded thread | `split_quoted` puts the newest message in `body`, the rest in `quoted_history`; the questions judge `body` |
+| a body that is quoted from its first line | no split: it is the newest message, and it stays in `body` where the questions read it |
 | a body longer than the budget | clipped to `BODY_CHARS_BUDGET`, `truncated: true` in the state, `decision.body_chars_cut` says how much was lost |
+| a body over **both** budgets | clipped on both, still one request: body and history are shares of one allowance, so the pair cannot overrun the limit |
 | non-English | sent as written — no translation step — and the queue floor rises to `FLOOR_QUEUE_NON_ENGLISH` |
 | a body instructing the triage system | the `steering` question covers it; fallback queue, automation off, nothing flagged |
 | more categories or queues than a Choice takes | capped at 255 with the fallback queue always kept, and every dropped id is on `decision.dropped` |
+| a desk with one category or one queue | routed as usual, but that Choice's confidence is 1.0 by construction, so the auto-reply and the refund flag stay off and `decision.detail` says which Choice it was |
 
 ## The honest limits
 
@@ -237,11 +304,25 @@ Two honest readings of that table:
   style is not in `QUOTE_MARKERS`, the whole thread lands in `body` and an old request can
   be read as the current one. Add your marker and test it; this is the part of the recipe
   most likely to break on a real inbox.
+- **A marker that fires too eagerly is the same failure pointing the other way,** and it is
+  the worse of the two: it moves the live request into `quoted_history`, which every question
+  is told to read as background, so the ticket is judged on whatever fragment came first.
+  `^From:\s` did this to any sentence beginning "From: the dashboard I click Export…", which
+  is why the marker now asks for a header's address rather than the word. Test a new marker
+  against bodies that merely *contain* its wording, not only against real quoted threads.
+- **A Choice with one option is always fully confident.** `confidence` is derived from the
+  shape of the distribution, so a desk with a single category gets `probabilities ==
+  {"that_one": 1.0}` and `category_confidence == 1.0` on every ticket, whatever the ticket
+  says. `FLOOR_AUTO_REPLY` and `FLOOR_REFUND_FLAG` would then be satisfied by construction,
+  so the recipe refuses to read them that way: below `GATING_MIN_OPTIONS` the ticket still
+  routes, the permissions stay off, and `decision.detail` says which Choice was the problem.
+  The floors only carry their intended meaning with **at least two categories and two
+  queues**; that is the shape to build a desk in, not a workaround to remember.
 - **The batch's failure path costs money.** Isolating one failure re-asks every other
   ticket in the fan-out. On a 500-ticket batch with a single 429, that is 499 extra
   requests. Smaller batches, or `isolate_failures=False` plus a retry queue, are the way
   out.
-- **A cheap decision is not a free one.** At $0.07 per thousand tickets the interesting
+- **A cheap decision is not a free one.** At $0.06 per thousand tickets the interesting
   question is not the fee, it is what the misroutes cost. That number is not in this repo
   because it depends on your queues; shadow-route a share of traffic to
   `decision.top_queues[1]` and measure it.

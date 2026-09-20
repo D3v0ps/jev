@@ -7,11 +7,13 @@ every number here is a local measurement and no test reaches the network.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
+import pathlib
 import time
 
 import pytest
 
-from jevkit import limits
+from jevkit import cost, limits
 from jevkit.answers import Reply
 from jevkit.errors import QuestionShapeError
 from jevkit.pacing import RateLimiter
@@ -23,6 +25,7 @@ from jevkit.recipes.realtime_loop import (
     PLAN_HOLDS,
     STEERING,
     THREAT,
+    UNCHECKED,
     Account,
     Tick,
     cap_moves,
@@ -31,6 +34,8 @@ from jevkit.recipes.realtime_loop import (
     offer,
     run,
 )
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 #: The caller's fixed move enum. Every id the model can ever see is a key of this map.
 CATALOGUE = {
@@ -85,10 +90,17 @@ def plan_for(
 
 
 async def tick_once(async_jev, plan, tick: Tick | None = None, **kwargs):
-    """One `next_move` against a scripted client; returns the decision and the calls sent."""
+    """One `next_move` against a scripted client; returns the decision and the calls sent.
+
+    Unless a test says otherwise, the world is read again and has not moved: staleness is
+    checked and passes. `fingerprint_now` is a required argument of `next_move`, so no
+    test can lose the check by omission.
+    """
     client, calls = async_jev(plan)
+    used = tick if tick is not None else make_tick()
+    kwargs.setdefault("fingerprint_now", lambda: used.fingerprint)
     try:
-        decision = await next_move(client, tick if tick is not None else make_tick(), **kwargs)
+        decision = await next_move(client, used, **kwargs)
     finally:
         await client.aclose()
     return decision, calls
@@ -149,6 +161,42 @@ async def test_an_illegal_move_is_structurally_unofferable(async_jev):
     assert decision.move in set(LEGAL) | {SAFE_DEFAULT}
     with pytest.raises(KeyError, match="not moves in the catalogue"):
         offer(CATALOGUE, ["advance", "fly"])
+
+
+async def test_the_catalogue_is_enforced_where_the_request_is_built(async_jev):
+    """A legal set carrying an id the catalogue does not hold holds the tick, offline."""
+    tick = make_tick(catalogue=CATALOGUE, legal={"detonate": "blow the charge", "stop": "hold"})
+    decision, calls = await tick_once(async_jev, plan_for(), tick)
+
+    assert calls == [], "a move outside the catalogue must not reach the wire at all"
+    assert decision.reason == "failed"
+    assert decision.move == SAFE_DEFAULT and decision.safe is True
+    assert "detonate" in decision.detail and "catalogue" in decision.detail
+
+
+async def test_a_catalogue_supplies_the_offered_ids_in_its_own_order(async_jev):
+    """With a catalogue, descriptions and order come from the caller's enum, not from `legal`."""
+    tick = make_tick(catalogue=CATALOGUE, legal=["stop", "advance"])
+    _, calls = await tick_once(async_jev, plan_for({"advance": 0.9, "stop": 0.1}), tick)
+    assert calls[0].questions[MOVE]["criteria"] == {
+        "advance": CATALOGUE["advance"],
+        "stop": CATALOGUE["stop"],
+    }
+
+
+async def test_a_safe_default_outside_the_catalogue_is_refused(async_jev):
+    """A hold that would execute an unknown move is a configuration bug, not a safe default."""
+    client, calls = async_jev(plan_for())
+    try:
+        with pytest.raises(KeyError, match="safe default"):
+            await next_move(
+                client,
+                make_tick(catalogue=CATALOGUE, safe_default="teleport"),
+                fingerprint_now=None,
+            )
+    finally:
+        await client.aclose()
+    assert calls == []
 
 
 async def test_bare_move_ids_are_offered_without_descriptions(async_jev):
@@ -315,11 +363,67 @@ async def test_a_world_that_stayed_put_is_acted_on(async_jev):
     assert decision.reason == "chosen"
 
 
+async def test_the_staleness_check_cannot_be_lost_by_omission(async_jev):
+    """`fingerprint_now` has no default: forgetting it is a TypeError, not a silent opt-out."""
+    client, _ = async_jev(plan_for())
+    try:
+        with pytest.raises(TypeError, match="fingerprint_now"):
+            await next_move(client, make_tick())  # type: ignore[call-arg]
+        with pytest.raises(TypeError, match="fingerprint_now"):
+            await run(client, lambda index: make_tick(), ticks=1)  # type: ignore[call-arg]
+    finally:
+        await client.aclose()
+
+
+async def test_an_unchecked_world_is_recorded_and_sustains_nothing(async_jev):
+    """Opting out is allowed, invisible is not: the decision and the report both say so."""
+    unchecked, _ = await tick_once(async_jev, plan_for(), fingerprint_now=None)
+    assert unchecked.reason == "chosen"
+    assert unchecked.staleness_checked is False
+    assert "staleness unchecked" in unchecked.line()
+
+    checked, _ = await tick_once(async_jev, plan_for())
+    assert checked.staleness_checked is True and "unchecked" not in checked.line()
+
+    client, _ = async_jev(plan_for())
+    try:
+        report = await run(
+            client,
+            lambda index: make_tick(),
+            ticks=3,
+            fingerprint_now=None,
+            budget_ms=5_000.0,
+        )
+    finally:
+        await client.aclose()
+
+    assert report.count("chosen") == 3 and report.stale_drops == 0
+    assert report.unchecked_staleness == 3
+    assert not report.sustains(0.001), "no stale drops means nothing when the check never ran"
+    assert "3 unchecked" in report.summary()
+
+
+async def test_none_is_a_fingerprint_like_any_other_not_an_opt_out(async_jev):
+    """The opt-out is the `UNCHECKED` sentinel, so a caller whose fingerprint is None is checked."""
+    decision, _ = await tick_once(
+        async_jev, plan_for(), make_tick(fingerprint=None), fingerprint_now=lambda: None
+    )
+    assert decision.reason == "chosen" and decision.staleness_checked is True
+    moved, _ = await tick_once(
+        async_jev, plan_for(), make_tick(fingerprint=None), fingerprint_now=lambda: "moved"
+    )
+    assert moved.reason == "stale" and moved.staleness_checked is True
+    assert UNCHECKED is not None
+
+
 async def test_a_late_answer_is_never_awaited_or_acted_on(async_jev):
     client, calls = async_jev(plan_for())
     started = time.perf_counter()
+    tick = make_tick()
     try:
-        decision = await next_move(SlowJev(client, 0.5), make_tick(), budget_ms=5.0)
+        decision = await next_move(
+            SlowJev(client, 0.5), tick, fingerprint_now=lambda: tick.fingerprint, budget_ms=5.0
+        )
     finally:
         await client.aclose()
     elapsed = time.perf_counter() - started
@@ -397,13 +501,19 @@ def test_the_threat_rubric_is_checked_against_the_score_limits(monkeypatch, leve
 async def test_run_measures_the_rate_it_achieved(async_jev):
     client, calls = async_jev(plan_for())
     acted: list[str] = []
+    world = {"fingerprint": "t0"}
+
+    def sense(index: int) -> Tick:
+        world["fingerprint"] = f"t{index}"
+        return make_tick(fingerprint=f"t{index}")
+
     try:
         report = await run(
             client,
-            lambda index: make_tick(fingerprint=f"t{index}"),
+            sense,
             ticks=5,
             act=lambda decision: acted.append(decision.move),
-            fingerprint_now=None,
+            fingerprint_now=lambda: world["fingerprint"],
             budget_ms=5_000.0,
         )
     finally:
@@ -413,7 +523,9 @@ async def test_run_measures_the_rate_it_achieved(async_jev):
     assert acted == ["advance"] * 5, "the caller executes every decision, including a hold"
     assert report.ticks == 5 and report.safe_defaults == 0
     assert report.deadline_misses == 0 and report.stale_drops == 0
+    assert report.unchecked_staleness == 0, "every answer was checked against a re-read world"
     assert report.achieved_rate > 0 and report.wall_s > 0
+    assert report.chosen_rate == pytest.approx(report.achieved_rate), "every tick chose a move"
     assert report.p50_ms is not None and report.p95_ms >= report.p50_ms
     assert report.sequential_rate == pytest.approx(1000.0 / report.p50_ms)
     assert report.input_tokens > 0
@@ -437,6 +549,7 @@ async def test_run_counts_the_ticks_it_had_to_drop(async_jev):
             SlowJev(client, 0.5),
             lambda index: make_tick(),
             ticks=2,
+            fingerprint_now=None,
             budget_ms=5.0,
         )
     finally:
@@ -446,7 +559,86 @@ async def test_run_counts_the_ticks_it_had_to_drop(async_jev):
     assert not stale.sustains(0.001), "a run that acted on nothing sustains nothing"
     assert missed.deadline_misses == 2 and missed.calls == 0
     assert missed.p50_ms is None and missed.sequential_rate is None
+    assert missed.unchecked_staleness == 0, "no answer arrived, so no check was skipped"
     assert "no answers landed" in missed.summary()
+
+
+async def test_overhead_counts_every_millisecond_no_answer_was_waited_for(async_jev):
+    """Overhead is wall time minus the *ledger's* request waits, so a burned deadline lands in it.
+
+    A decision's own `latency_ms` is whole-tick elapsed time on the holds that never asked,
+    and subtracting those booked a run of pure overhead as a run with none.
+    """
+    client, _ = async_jev(plan_for())
+    try:
+        held = await run(
+            client,
+            lambda index: make_tick(legal={}),
+            ticks=20,
+            fingerprint_now=None,
+            budget_ms=5_000.0,
+        )
+        missed = await run(
+            SlowJev(client, 0.5),
+            lambda index: make_tick(),
+            ticks=2,
+            fingerprint_now=None,
+            budget_ms=20.0,
+        )
+        answered = await run(
+            client,
+            lambda index: make_tick(),
+            ticks=3,
+            fingerprint_now=lambda: "t0",
+            budget_ms=5_000.0,
+        )
+    finally:
+        await client.aclose()
+
+    assert held.calls == 0 and held.count("no_legal_moves") == 20
+    assert held.overhead_s == held.wall_s, "a run that never asked is all overhead"
+
+    assert missed.calls == 0 and missed.deadline_misses == 2
+    assert missed.overhead_s == missed.wall_s, "the deadline a missed tick burned is overhead"
+    assert missed.wall_s > 2 * 0.020 * 0.8, "both deadlines were actually burned"
+    assert "0.0 ms/tick overhead" not in missed.summary()
+
+    assert answered.calls == 3
+    assert answered.overhead_s == pytest.approx(
+        answered.wall_s - sum(answered.latencies_ms) / 1000.0
+    ), "only waits an answer came back from are subtracted"
+    assert answered.overhead_s < answered.wall_s
+
+
+async def test_a_run_that_chose_no_move_sustains_nothing(async_jev):
+    """The rate that certifies a loop is the moves it decided, not the ticks it burned."""
+    client, _ = async_jev({})  # unscripted: uniform answers, so confidence sits far below the bar
+    try:
+        idle = await run(
+            client,
+            lambda index: make_tick(),
+            ticks=6,
+            fingerprint_now=lambda: "t0",
+            budget_ms=5_000.0,
+        )
+        silent = await run(
+            client,
+            lambda index: make_tick(legal={}),
+            ticks=20,
+            fingerprint_now=None,
+            budget_ms=5_000.0,
+        )
+    finally:
+        await client.aclose()
+
+    assert idle.count("low_confidence") == 6 and idle.count("chosen") == 0
+    assert idle.chosen_rate == 0.0 and idle.achieved_rate > loop.TARGET_RATE_PER_SECOND
+    assert not idle.sustains(), "twelve held ticks a second is not ten decisions a second"
+    assert not idle.sustains(0.001)
+    assert "0.0/s moves chosen" in idle.summary()
+
+    assert silent.calls == 0 and silent.achieved_rate > loop.TARGET_RATE_PER_SECOND
+    assert not silent.sustains(), "a run that sent no request cannot sustain a decision rate"
 
 
 async def test_run_installs_a_limiter_for_the_run_and_hands_it_back(async_jev):
@@ -460,6 +652,7 @@ async def test_run_installs_a_limiter_for_the_run_and_hands_it_back(async_jev):
             client,
             lambda index: make_tick(),
             ticks=3,
+            fingerprint_now=lambda: "t0",
             limiter=limiter,
             budget_ms=5_000.0,
         )
@@ -470,7 +663,13 @@ async def test_run_installs_a_limiter_for_the_run_and_hands_it_back(async_jev):
 
         client.limiter = limiter
         with pytest.raises(ValueError, match="already carries a limiter"):
-            await run(client, lambda index: make_tick(), ticks=1, limiter=limiter)
+            await run(
+                client,
+                lambda index: make_tick(),
+                ticks=1,
+                fingerprint_now=lambda: "t0",
+                limiter=limiter,
+            )
     finally:
         await client.aclose()
 
@@ -479,7 +678,7 @@ async def test_run_refuses_a_negative_tick_count(async_jev):
     client, _ = async_jev(plan_for())
     try:
         with pytest.raises(ValueError, match="negative"):
-            await run(client, lambda index: make_tick(), ticks=-1)
+            await run(client, lambda index: make_tick(), ticks=-1, fingerprint_now=None)
     finally:
         await client.aclose()
 
@@ -492,3 +691,84 @@ def test_the_account_ceiling_is_shared_by_every_loop_on_the_key():
     assert not Account(loops=3).fits
     assert "needs pacing" in Account(loops=3).line()
     assert Account(loops=40, per_loop_rate=0.5).fits
+
+
+# --- the numbers the doc quotes -------------------------------------------
+
+
+def example_module():
+    """The example, imported by path so this test does not depend on sys.path."""
+    spec = importlib.util.spec_from_file_location(
+        "realtime_loop_example", ROOT / "examples" / "realtime_loop.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def example_first_tick():
+    """The Tick `examples/realtime_loop.py` builds on tick 0, before any move is executed."""
+    example = example_module()
+    world = example.Corridor()
+    return example, Tick(
+        world=world.observe(0),
+        legal=world.legal(),
+        fingerprint=world.fingerprint(),
+        safe_default=example.SAFE_DEFAULT,
+        goal=example.GOAL,
+        plan=example.PLAN,
+        committing=example.COMMITTING,
+        catalogue=example.MOVES,
+    )
+
+
+def test_the_documented_cost_table_is_what_the_code_produces():
+    """The source of the table in docs/realtime_loop.md, which names this test.
+
+    `limits.estimate_tokens` is a 4-chars-per-token size estimate over the encoded body,
+    not a tokenizer and not a billed figure, so these are the numbers a reader can
+    reproduce offline — not what a live call would report.
+    """
+    example, tick = example_first_tick()
+    offered, dropped = cap_moves(offer(example.MOVES, tick.legal))
+    assert dropped == ()
+    assert len(offered) == 4 and "reverse" not in offered, "tick 0 has executed no move yet"
+
+    state_tokens = limits.estimate_tokens(loop.build_state(tick))
+    questions = loop.build_questions(offered, tick.goal)
+    per_question = {qid: limits.estimate_tokens(question) for qid, question in questions.items()}
+    total = state_tokens + sum(per_question.values())
+
+    assert state_tokens == 86
+    assert per_question == {MOVE: 235, THREAT: 137, PLAN_HOLDS: 108, STEERING: 128}
+    assert total == 694 and sum(per_question.values()) == 608
+    assert state_tokens + max(per_question.values()) == 321
+    assert limits.estimate_tokens(loop.build_questions(example.MOVES, tick.goal)[MOVE]) == 251, (
+        "all five moves described would be 251, which is why the row says four"
+    )
+
+    usd = cost.usd_for("jev-1.13.0", total)
+    assert f"{usd:.7f}" == "0.0000291"
+    assert 34_000 <= 1 / usd < 35_000
+    assert f"{1_000 * usd:.4f}" == "0.0291"
+    assert f"{36_000 * usd:.2f}" == "1.05", "10 decisions/s for an hour, if a loop held that rate"
+    assert f"{8 * 36_000 * usd:.2f}" == "8.39"
+
+    short = {f"m{index}": None for index in range(limits.CHOICE_MAX_OPTIONS)}
+    long = {f"move_{index:03d}": None for index in range(limits.CHOICE_MAX_OPTIONS)}
+    assert limits.estimate_tokens(loop.build_questions(short, tick.goal)[MOVE]) == 1_034
+    assert limits.estimate_tokens(loop.build_questions(long, tick.goal)[MOVE]) == 1_316
+
+
+def test_the_doc_quotes_those_numbers_and_no_others():
+    """Every figure in the doc's cost table is one this test file produced above."""
+    doc = (ROOT / "docs" / "realtime_loop.md").read_text()
+    for number in (86, 235, 137, 108, 128):
+        assert f"| {number} |" in doc, f"the table lost the measured {number}"
+    assert "| **694** |" in doc
+    assert "4 described moves" in doc and "reverse" in doc
+    assert "$0.0000291" in doc and "1,034" in doc and "1,316" in doc
+    assert "321 tokens" in doc
+    assert "tests/test_realtime_loop.py::test_the_documented_cost_table_is_what_the_code_produces" in doc
+    for absent in ("0.4 ms", "1,000 ticks/s", "three runs, same figure"):
+        assert absent not in doc, f"{absent!r} is a live-run figure this repo cannot produce"
